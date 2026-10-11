@@ -191,3 +191,33 @@ class SmartMedicalApiTests(APITestCase):
         self.auth(self.admin);response=self.client.post('/api/v1/billing-records/',{'patient_id':self.patient.pk,'category':'inpatient','description':'住院综合费用','amount':'680.00'},format='json');self.assertEqual(response.status_code,201,response.data);bill_id=response.data['id']
         self.auth(self.patient_user);response=self.client.post(f'/api/v1/billing-records/{bill_id}/pay/',{'payment_method':'演示支付'},format='json');self.assertEqual(response.status_code,200,response.data);self.assertEqual(response.data['status'],BillingRecord.Status.PAID)
         self.auth(self.admin);medicine=Medicine.objects.create(name='测试药品',specification='10mg',unit='盒',stock=5);response=self.client.post(f'/api/v1/medicines/{medicine.pk}/adjust-stock/',{'delta':8},format='json');self.assertEqual(response.status_code,200,response.data);self.assertEqual(response.data['stock'],13)
+
+    def test_bed_and_examination_catalog_filters(self):
+        available=WardBed.objects.create(department=self.department,ward_name='A 病区',bed_no='01',daily_rate='100.00')
+        occupied=WardBed.objects.create(department=self.department,ward_name='A 病区',bed_no='02',daily_rate='100.00',is_occupied=True)
+        inactive=WardBed.objects.create(department=self.department,ward_name='A 病区',bed_no='03',daily_rate='100.00',is_active=False)
+        lab=ExaminationItem.objects.create(name='血常规',category='lab',price='30.00')
+        disabled=ExaminationItem.objects.create(name='停用项目',category='other',price='0.00',is_active=False)
+        self.auth(self.admin)
+        response=self.client.get('/api/v1/ward-beds/',{'department':self.department.pk,'available':'true'})
+        self.assertEqual(response.status_code,200,response.data);self.assertEqual([row['id'] for row in response.data['results']],[available.pk])
+        response=self.client.get('/api/v1/ward-beds/',{'active':'false'})
+        self.assertEqual([row['id'] for row in response.data['results']],[inactive.pk])
+        response=self.client.get('/api/v1/examination-items/',{'active':'true'})
+        self.assertEqual([row['id'] for row in response.data['results']],[lab.pk])
+        response=self.client.get('/api/v1/examination-items/',{'active':'false'})
+        self.assertEqual([row['id'] for row in response.data['results']],[disabled.pk])
+
+    def test_stock_movement_filters_and_billing_source_ids(self):
+        medicine=Medicine.objects.create(name='流水查询药',specification='1mg',price='10.00',stock=3)
+        receipt=MedicineStockMovement.objects.create(medicine=medicine,movement_type='receipt',quantity=3,balance_after=3,operator=self.admin,note='初始入库')
+        adjustment=MedicineStockMovement.objects.create(medicine=medicine,movement_type='adjustment',quantity=2,balance_after=5,operator=self.admin,note='补货')
+        self.auth(self.admin)
+        response=self.client.get('/api/v1/medicine-stock-movements/',{'movement_type':'receipt','date_from':str(date.today())})
+        self.assertEqual(response.status_code,200,response.data);self.assertEqual([row['id'] for row in response.data['results']],[receipt.pk])
+        record=self.confirmed_record();item=ExaminationItem.objects.create(name='检查计费来源',category='lab',price='45.00')
+        self.auth(self.doctor_user);created=self.client.post('/api/v1/examinations/',{'record_id':record.pk,'item_id':item.pk,'type':'lab','clinical_question':'演示'},format='json')
+        self.assertEqual(created.status_code,201,created.data)
+        bill=BillingRecord.objects.get(examination_id=created.data['id'])
+        self.auth(self.admin);bill_response=self.client.get(f'/api/v1/billing-records/{bill.pk}/')
+        self.assertEqual(bill_response.status_code,200,bill_response.data);self.assertEqual(bill_response.data['source_type'],'examination');self.assertEqual(bill_response.data['examination_id'],created.data['id'])

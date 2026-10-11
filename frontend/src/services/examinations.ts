@@ -2,7 +2,7 @@ import api from './api'
 import type{ExaminationOrder,PageResult}from'../types/medical'
 const unpack=<T>(data:T[]|PageResult<T>)=>Array.isArray(data)?{count:data.length,results:data}:data
 export async function getExaminations(params:Record<string,unknown>={}){return unpack((await api.get<ExaminationOrder[]|PageResult<ExaminationOrder>>('examinations/',{params})).data)}
-export async function createExamination(payload:{record_id:number;type:string;clinical_question:string}){return(await api.post<ExaminationOrder>('examinations/',payload)).data}
+export async function createExamination(payload:{record_id:number;item_id:number;type:string;clinical_question:string}){return(await api.post<ExaminationOrder>('examinations/',payload)).data}
 export async function startExamination(id:number){return(await api.post<ExaminationOrder>(`examinations/${id}/start/`)).data}
 export async function saveReport(id:number,payload:{findings:string;conclusion:string}){return(await api.post(`examinations/${id}/report/`,payload)).data}
 export async function publishReport(id:number){return(await api.post<ExaminationOrder>(`examinations/${id}/publish/`)).data}

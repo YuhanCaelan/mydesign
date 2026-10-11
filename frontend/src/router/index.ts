@@ -18,6 +18,7 @@ const routes:RouteRecordRaw[]=[
     route('/console/schedules','admin-schedules','admin/Schedules',['admin']),
     route('/console/appointments','admin-appointments','shared/Appointments',['admin']),
     route('/console/examinations','admin-examinations','shared/Examinations',['admin']),
+    route('/console/resources','admin-resources','admin/ClinicalResources',['admin']),
     route('/console/inpatients','admin-inpatients','shared/Inpatients',['admin']),
     route('/console/billing','admin-billing','shared/Billing',['admin']),
     route('/console/medicines','admin-medicines','shared/Medicines',['admin']),

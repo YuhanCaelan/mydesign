@@ -239,23 +239,29 @@ class MedicineStockMovementViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes=[IsAdmin];serializer_class=MedicineStockMovementSerializer;queryset=MedicineStockMovement.objects.select_related('medicine','operator','prescription')
     search_fields=('medicine__name','note','prescription__prescription_no');ordering_fields=('created_at',)
     def get_queryset(self):
-        qs=super().get_queryset();medicine=self.request.query_params.get('medicine')
-        return qs.filter(medicine_id=medicine) if medicine else qs
+        qs=super().get_queryset();medicine=self.request.query_params.get('medicine');movement_type=self.request.query_params.get('movement_type');date_from=self.request.query_params.get('date_from');date_to=self.request.query_params.get('date_to')
+        if medicine:qs=qs.filter(medicine_id=medicine)
+        if movement_type:qs=qs.filter(movement_type=movement_type)
+        if date_from:qs=qs.filter(created_at__date__gte=date_from)
+        if date_to:qs=qs.filter(created_at__date__lte=date_to)
+        return qs
 
 class ExaminationItemViewSet(viewsets.ModelViewSet):
     permission_classes=[IsAdminOrReadOnly];serializer_class=ExaminationItemSerializer;queryset=ExaminationItem.objects.all();http_method_names=['get','post','patch','head','options']
     search_fields=('name','description');ordering_fields=('name','price','category')
     def get_queryset(self):
         qs=super().get_queryset();active=self.request.query_params.get('active')
-        return qs.filter(is_active=True) if active=='true' else qs
+        if active in {'true','false'}:qs=qs.filter(is_active=active=='true')
+        return qs
 
 class WardBedViewSet(viewsets.ModelViewSet):
     permission_classes=[IsAdminOrReadOnly];serializer_class=WardBedSerializer;queryset=WardBed.objects.select_related('department');http_method_names=['get','post','patch','head','options']
     search_fields=('ward_name','bed_no','department__name');ordering_fields=('ward_name','bed_no','daily_rate')
     def get_queryset(self):
-        qs=super().get_queryset();department=self.request.query_params.get('department');available=self.request.query_params.get('available')
+        qs=super().get_queryset();department=self.request.query_params.get('department');available=self.request.query_params.get('available');active=self.request.query_params.get('active')
         if department:qs=qs.filter(department_id=department)
         if available=='true':qs=qs.filter(is_active=True,is_occupied=False)
+        if active in {'true','false'}:qs=qs.filter(is_active=active=='true')
         return qs
 
 class PrescriptionViewSet(viewsets.ModelViewSet):

@@ -1,5 +1,5 @@
 import api from './api'
-import type{BillingRecord,Department,DoctorSummary,InpatientAdmission,Medicine,PageResult,PatientSummary}from'../types/medical'
+import type{BillingRecord,Department,DoctorSummary,ExaminationItem,InpatientAdmission,Medicine,PageResult,PatientSummary,StockMovement,WardBed}from'../types/medical'
 const unpack=<T>(data:T[]|PageResult<T>)=>Array.isArray(data)?{count:data.length,results:data}:data
 export async function getMedicines(params:Record<string,unknown>={}){return unpack((await api.get<Medicine[]|PageResult<Medicine>>('medicines/',{params})).data)}
 export async function saveMedicine(payload:Record<string,unknown>,id?:number){return(await(id?api.patch<Medicine>(`medicines/${id}/`,payload):api.post<Medicine>('medicines/',payload))).data}
@@ -15,3 +15,8 @@ export async function dischargePatient(id:number,discharge_summary:string){retur
 export async function getPatients(){return unpack((await api.get<PatientSummary[]|PageResult<PatientSummary>>('patients/')).data).results}
 export async function getOperationDoctors(){return unpack((await api.get<DoctorSummary[]|PageResult<DoctorSummary>>('doctors/')).data).results}
 export async function getOperationDepartments(){return unpack((await api.get<Department[]|PageResult<Department>>('departments/',{params:{status:'active'}})).data).results}
+export async function getWardBeds(params:Record<string,unknown>={}){return unpack((await api.get<WardBed[]|PageResult<WardBed>>('ward-beds/',{params})).data)}
+export async function saveWardBed(payload:Record<string,unknown>,id?:number){return(await(id?api.patch<WardBed>(`ward-beds/${id}/`,payload):api.post<WardBed>('ward-beds/',payload))).data}
+export async function getExaminationItems(params:Record<string,unknown>={}){return unpack((await api.get<ExaminationItem[]|PageResult<ExaminationItem>>('examination-items/',{params})).data)}
+export async function saveExaminationItem(payload:Record<string,unknown>,id?:number){return(await(id?api.patch<ExaminationItem>(`examination-items/${id}/`,payload):api.post<ExaminationItem>('examination-items/',payload))).data}
+export async function getStockMovements(params:Record<string,unknown>={}){return unpack((await api.get<StockMovement[]|PageResult<StockMovement>>('medicine-stock-movements/',{params})).data)}

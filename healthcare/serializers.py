@@ -157,8 +157,9 @@ class WardBedSerializer(serializers.ModelSerializer):
 class BillingSerializer(serializers.ModelSerializer):
     patient_id=serializers.PrimaryKeyRelatedField(source='patient',queryset=PatientProfile.objects.all());appointment_id=serializers.PrimaryKeyRelatedField(source='appointment',queryset=Appointment.objects.all(),required=False,allow_null=True)
     patient_name=serializers.CharField(source='patient.user.get_full_name',read_only=True);category_display=serializers.CharField(source='get_category_display',read_only=True);status_display=serializers.CharField(source='get_status_display',read_only=True);prescription_no=serializers.CharField(source='prescription.prescription_no',read_only=True)
+    prescription_id=serializers.IntegerField(read_only=True);examination_id=serializers.IntegerField(read_only=True);admission_id=serializers.IntegerField(read_only=True)
     examination_no=serializers.CharField(source='examination.order_no',read_only=True);admission_no=serializers.CharField(source='admission.admission_no',read_only=True);source_type=serializers.SerializerMethodField()
-    class Meta:model=BillingRecord;fields=('id','bill_no','patient_id','patient_name','appointment_id','prescription_no','examination_no','admission_no','source_type','category','category_display','description','amount','status','status_display','payment_method','paid_at','created_at');read_only_fields=('bill_no','status','payment_method','paid_at','created_at')
+    class Meta:model=BillingRecord;fields=('id','bill_no','patient_id','patient_name','appointment_id','prescription_id','prescription_no','examination_id','examination_no','admission_id','admission_no','source_type','category','category_display','description','amount','status','status_display','payment_method','paid_at','created_at');read_only_fields=('bill_no','status','payment_method','paid_at','created_at')
     def get_source_type(self,obj):
         if obj.prescription_id:return 'prescription'
         if obj.examination_id:return 'examination'
