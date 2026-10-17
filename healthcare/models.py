@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
@@ -97,11 +98,16 @@ class Appointment(TimeStampedModel):
     appointment_no=models.CharField(max_length=24,unique=True,blank=True)
     patient=models.ForeignKey(PatientProfile,on_delete=models.PROTECT,related_name='appointments')
     doctor=models.ForeignKey(DoctorProfile,on_delete=models.PROTECT,related_name='appointments')
-    slot=models.OneToOneField(AppointmentSlot,on_delete=models.PROTECT,related_name='appointment')
+    department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='appointments',verbose_name='预约科室快照')
+    slot=models.ForeignKey(AppointmentSlot,on_delete=models.PROTECT,related_name='appointments')
     status=models.CharField(max_length=16,choices=Status.choices,default=Status.PENDING,db_index=True)
     reason=models.TextField();cancelled_at=models.DateTimeField(null=True,blank=True);completed_at=models.DateTimeField(null=True,blank=True)
-    class Meta:ordering=['-slot__schedule__date','-slot__start_time'];indexes=[models.Index(fields=['patient','status']),models.Index(fields=['doctor','status'])]
+    class Meta:
+        ordering=['-slot__schedule__date','-slot__start_time']
+        indexes=[models.Index(fields=['patient','status'],name='idx_appointment_patient_status'),models.Index(fields=['doctor','status'],name='idx_appointment_doctor_status'),models.Index(fields=['department','status'],name='idx_appointment_dept_status'),models.Index(fields=['status','created_at'],name='idx_appointment_status_created')]
+        constraints=[models.UniqueConstraint(fields=['slot'],condition=models.Q(status__in=['pending','in_progress','completed']),name='uq_active_appointment_slot')]
     def save(self,*args,**kwargs):
+        if self.department_id is None and self.doctor_id:self.department_id=self.doctor.department_id
         fresh=self.pk is None;super().save(*args,**kwargs)
         if fresh and not self.appointment_no:self.appointment_no=f'A{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(appointment_no=self.appointment_no)
 
@@ -114,7 +120,9 @@ class MedicalRecord(TimeStampedModel):
     examination=models.TextField(blank=True);diagnosis=models.TextField();treatment=models.TextField(blank=True)
     status=models.CharField(max_length=12,choices=Status.choices,default=Status.DRAFT,db_index=True)
     confirmed_at=models.DateTimeField(null=True,blank=True)
-    class Meta:ordering=['-updated_at']
+    class Meta:
+        ordering=['-updated_at']
+        indexes=[models.Index(fields=['status','confirmed_at'],name='idx_medrec_status_confirmed')]
     def save(self,*args,**kwargs):
         if self.pk:
             old=type(self).objects.filter(pk=self.pk).first()
@@ -167,6 +175,7 @@ class PrescriptionItem(models.Model):
     medicine=models.ForeignKey(Medicine,on_delete=models.PROTECT,related_name='prescription_items')
     dosage=models.CharField(max_length=80);frequency=models.CharField(max_length=80);duration=models.CharField(max_length=80,blank=True)
     quantity=models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    unit_price_snapshot=models.DecimalField('开具时单价',max_digits=10,decimal_places=2,null=True,blank=True,help_text='历史处方可能为空，展示时回退到原账单总额。')
 
 
 class ExaminationItem(TimeStampedModel):
@@ -192,7 +201,9 @@ class ExaminationOrder(TimeStampedModel):
     price_snapshot=models.DecimalField(max_digits=10,decimal_places=2,default=0)
     type=models.CharField(max_length=12,choices=Type.choices);status=models.CharField(max_length=16,choices=Status.choices,default=Status.REQUESTED,db_index=True)
     clinical_question=models.TextField();completed_at=models.DateTimeField(null=True,blank=True)
-    class Meta:ordering=['-created_at']
+    class Meta:
+        ordering=['-created_at']
+        indexes=[models.Index(fields=['patient','status'],name='idx_examorder_patient_status'),models.Index(fields=['created_at'],name='idx_examorder_created')]
     def save(self,*args,**kwargs):
         fresh=self.pk is None;super().save(*args,**kwargs)
         if fresh and not self.order_no:self.order_no=f'EX{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(order_no=self.order_no)
@@ -220,12 +231,17 @@ class BillingRecord(TimeStampedModel):
     patient=models.ForeignKey(PatientProfile,on_delete=models.PROTECT,related_name='billing_records');appointment=models.ForeignKey(Appointment,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_records');prescription=models.OneToOneField(Prescription,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
     examination=models.OneToOneField(ExaminationOrder,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
     admission=models.OneToOneField('InpatientAdmission',on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
+    inpatient_admission=models.ForeignKey('InpatientAdmission',on_delete=models.PROTECT,null=True,blank=True,related_name='charges',verbose_name='所属住院')
     category=models.CharField(max_length=20,choices=Category.choices,default=Category.OTHER);description=models.CharField(max_length=200);amount=models.DecimalField(max_digits=10,decimal_places=2);status=models.CharField(max_length=12,choices=Status.choices,default=Status.UNPAID)
     payment_method=models.CharField(max_length=30,blank=True);paid_at=models.DateTimeField(null=True,blank=True)
-    class Meta:ordering=['-created_at']
+    class Meta:
+        ordering=['-created_at'];constraints=[models.CheckConstraint(condition=models.Q(amount__gte=0),name='ck_billing_amount_non_negative')]
+        indexes=[models.Index(fields=['patient','category','created_at'],name='idx_billing_patient_cat_date'),models.Index(fields=['status','created_at'],name='idx_billing_status_created'),models.Index(fields=['inpatient_admission'],name='idx_billing_admission')]
     def save(self,*args,**kwargs):
         fresh=self.pk is None;super().save(*args,**kwargs)
         if fresh and not self.bill_no:self.bill_no=f'BL{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(bill_no=self.bill_no)
+    @property
+    def days_admitted(self):return self.admission.days_admitted if self.admission_id else None
 
 
 class WardBed(TimeStampedModel):
@@ -257,6 +273,20 @@ class InpatientAdmission(TimeStampedModel):
     def save(self,*args,**kwargs):
         fresh=self.pk is None;super().save(*args,**kwargs)
         if fresh and not self.admission_no:self.admission_no=f'IP{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(admission_no=self.admission_no)
+    @property
+    def billable_days(self):
+        if not self.admitted_at:return 0
+        start=timezone.localtime(self.admitted_at).date()
+        end=timezone.localtime(self.discharged_at).date() if self.discharged_at else timezone.localdate()
+        return max(1,(end-start).days+1)
+    @property
+    def days_admitted(self):
+        if self.status!=self.Status.ADMITTED or not self.admitted_at:return 0
+        return max(1,(timezone.localdate()-timezone.localtime(self.admitted_at).date()).days+1)
+    @property
+    def projected_bed_fee(self):
+        if self.status!=self.Status.ADMITTED:return Decimal('0')
+        return self.daily_rate_snapshot*self.days_admitted
 
 
 class AIService(TimeStampedModel):

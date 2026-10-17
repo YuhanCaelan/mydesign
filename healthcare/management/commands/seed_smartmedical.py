@@ -47,7 +47,12 @@ class Command(BaseCommand):
         past=[s for s in all_slots if s.schedule.date<today];current=[s for s in all_slots if s.schedule.date==today];future=[s for s in all_slots if s.schedule.date>today]
         past_chosen=[past[int(i*(len(past)-1)/75)] for i in range(76)]
         future_chosen=[future[int(i*(len(future)-1)/15)] for i in range(16)]
-        chosen=past_chosen[:62]+current[:4]+future_chosen+past_chosen[62:];appointments=[]
+        # 多名医师同一时段同时接诊，便于演示科室“当前接诊患者”。
+        current_chosen=[]
+        for doctor in doctors[:4]:
+            slot=next((item for item in current if item.schedule.doctor_id==doctor.pk and item.start_time==time(8)),None)
+            if slot is not None:current_chosen.append(slot)
+        chosen=past_chosen[:62]+current_chosen+future_chosen+past_chosen[62:];appointments=[]
         status_cycle=[Appointment.Status.COMPLETED]*62+[Appointment.Status.IN_PROGRESS]*4+[Appointment.Status.PENDING]*16+[Appointment.Status.CANCELLED]*8+[Appointment.Status.NO_SHOW]*6
         reasons=['反复头痛','胸闷心悸','咳嗽发热','腹痛腹胀','术后复查','膝关节疼痛']
         for i,(slot,state) in enumerate(zip(chosen,status_cycle)):
@@ -67,31 +72,50 @@ class Command(BaseCommand):
         exam_items=[ExaminationItem.objects.create(name=n,category=c,price=p,description='虚构演示检查项目') for n,c,p in exam_specs]
         beds=[]
         for dep in departments[:6]:
-            for number in range(1,5):beds.append(WardBed.objects.create(department=dep,ward_name=f'{dep.name}一病区',bed_no=f'{number:02d}',daily_rate=Decimal('120.00')+number*10))
+            for room_index,room_name in enumerate(('一病区','二病区')):
+                for number in range(1,5):beds.append(WardBed.objects.create(department=dep,ward_name=f'{dep.name}{room_name}',bed_no=f'{number:02d}',daily_rate=Decimal('120.00')+room_index*30+number*10))
+        admissions=[]
+        for i in range(8):
+            record=records[i];bed=beds[i*5];admitted=now-timedelta(days=2+i);state=InpatientAdmission.Status.ADMITTED if i<4 else InpatientAdmission.Status.DISCHARGED;admission=InpatientAdmission.objects.create(patient=record.appointment.patient,attending_doctor=record.appointment.doctor,department=bed.department,appointment=record.appointment,bed=bed,ward=bed.ward_name,bed_no=bed.bed_no,daily_rate_snapshot=bed.daily_rate,admission_diagnosis=record.diagnosis,status=state,admitted_at=admitted,discharged_at=now-timedelta(days=i-3) if state==InpatientAdmission.Status.DISCHARGED else None,discharge_summary='病情好转，遵医嘱出院。' if state==InpatientAdmission.Status.DISCHARGED else '')
+            if state==InpatientAdmission.Status.ADMITTED:bed.is_occupied=True;bed.save(update_fields=['is_occupied','updated_at'])
+            else:BillingRecord.objects.create(patient=admission.patient,appointment=admission.appointment,admission=admission,inpatient_admission=admission,category=BillingRecord.Category.INPATIENT,description=f'{bed} 住院 {admission.billable_days} 天',amount=bed.daily_rate*admission.billable_days,status=BillingRecord.Status.PAID if i<6 else BillingRecord.Status.UNPAID,payment_method='演示支付' if i<6 else '',paid_at=now-timedelta(days=i-3) if i<6 else None)
+            admissions.append(admission)
+        def admission_for(appointment):
+            if appointment is None:return None
+            return next((item for item in admissions if item.appointment_id==appointment.pk),None)
         prescriptions=[]
         for i in range(38):
             record=records[i%62];state=Prescription.Status.DISPENSED if i<27 else Prescription.Status.ISSUED if i<34 else Prescription.Status.CANCELLED;rx=Prescription.objects.create(record=record,doctor=record.appointment.doctor,status=state,notes='饭后服用，遵医嘱。',dispensed_at=now-timedelta(days=i%25) if state==Prescription.Status.DISPENSED else None)
-            med=medicines[i%16];PrescriptionItem.objects.create(prescription=rx,medicine=med,dosage='每次 1 片',frequency='每日两次',duration='3 天',quantity=1)
+            med=medicines[i%16];PrescriptionItem.objects.create(prescription=rx,medicine=med,dosage='每次 1 片',frequency='每日两次',duration='3 天',quantity=1,unit_price_snapshot=med.price)
             if state==Prescription.Status.DISPENSED:
                 med.stock-=1;med.save(update_fields=['stock','updated_at']);med.stock_movements.create(movement_type=MedicineStockMovement.Type.DISPENSE,quantity=-1,balance_after=med.stock,prescription=rx,operator=admin,note='演示处方发药')
-            bill=BillingRecord.objects.create(patient=record.appointment.patient,appointment=record.appointment,prescription=rx,category=BillingRecord.Category.MEDICINE,description=f'处方 {rx.prescription_no}：{med.name}',amount=med.price,status=BillingRecord.Status.PAID if state==Prescription.Status.DISPENSED else BillingRecord.Status.CANCELLED if state==Prescription.Status.CANCELLED else BillingRecord.Status.UNPAID,payment_method='演示支付' if state==Prescription.Status.DISPENSED else '',paid_at=now-timedelta(days=i%25) if state==Prescription.Status.DISPENSED else None);prescriptions.append(rx)
+            bill=BillingRecord.objects.create(patient=record.appointment.patient,appointment=record.appointment,prescription=rx,inpatient_admission=admission_for(record.appointment),category=BillingRecord.Category.MEDICINE,description=f'处方 {rx.prescription_no}：{med.name}',amount=med.price,status=BillingRecord.Status.PAID if state==Prescription.Status.DISPENSED else BillingRecord.Status.CANCELLED if state==Prescription.Status.CANCELLED else BillingRecord.Status.UNPAID,payment_method='演示支付' if state==Prescription.Status.DISPENSED else '',paid_at=now-timedelta(days=i%25) if state==Prescription.Status.DISPENSED else None);prescriptions.append(rx)
         examinations=[]
         exam_states=[ExaminationOrder.Status.PUBLISHED]*18+[ExaminationOrder.Status.COMPLETED]*5+[ExaminationOrder.Status.IN_PROGRESS]*5+[ExaminationOrder.Status.REQUESTED]*4
         type_map={'lab':'lab','function':'other','imaging':'ct'}
         for i,state in enumerate(exam_states):
             record=records[i%62];item=exam_items[i%len(exam_items)];order=ExaminationOrder.objects.create(patient=record.appointment.patient,doctor=record.appointment.doctor,record=record,item=item,item_name_snapshot=item.name,price_snapshot=item.price,type=type_map[item.category],status=state,clinical_question='辅助明确诊断（虚构演示）',completed_at=now-timedelta(days=i%20) if state in {ExaminationOrder.Status.PUBLISHED,ExaminationOrder.Status.COMPLETED} else None)
-            BillingRecord.objects.create(patient=order.patient,appointment=record.appointment,examination=order,category=BillingRecord.Category.EXAMINATION,description=f'检查 {order.order_no}：{item.name}',amount=item.price,status=BillingRecord.Status.PAID if i<20 else BillingRecord.Status.UNPAID,payment_method='演示支付' if i<20 else '',paid_at=now-timedelta(days=i%20) if i<20 else None)
+            exam_bill=BillingRecord.objects.create(patient=order.patient,appointment=record.appointment,examination=order,inpatient_admission=admission_for(record.appointment),category=BillingRecord.Category.EXAMINATION,description=f'检查 {order.order_no}：{item.name}',amount=item.price,status=BillingRecord.Status.PAID if i<20 else BillingRecord.Status.UNPAID,payment_method='演示支付' if i<20 else '',paid_at=timezone.make_aware(datetime.combine(record.appointment.slot.schedule.date,time(11))) if i<20 else None)
+            # 检查费用跨周期分布：费用发生日期与就诊日期一致，便于演示近 7/30 天趋势。
+            BillingRecord.objects.filter(pk=exam_bill.pk).update(created_at=timezone.make_aware(datetime.combine(record.appointment.slot.schedule.date,time(10))))
             if state in {ExaminationOrder.Status.PUBLISHED,ExaminationOrder.Status.COMPLETED}:ExaminationReport.objects.create(order=order,findings='未见明显异常，该结果为虚构演示资料。',conclusion='建议结合临床随诊。',status=ExaminationReport.Status.PUBLISHED if state==ExaminationOrder.Status.PUBLISHED else ExaminationReport.Status.DRAFT,published_by=admin if state==ExaminationOrder.Status.PUBLISHED else None,published_at=now-timedelta(days=i%20) if state==ExaminationOrder.Status.PUBLISHED else None)
+            examinations.append(order)
+        # 为演示患者补充近 60 天的跨周期检查费用，覆盖近 7 天、近 30 天和本月筛选。
+        recent_samples=[(1,4,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.UNPAID),(3,5,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.PAID),(7,0,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.PAID),(12,2,ExaminationOrder.Status.COMPLETED,BillingRecord.Status.UNPAID),(20,6,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.PAID),(30,1,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.PAID),(45,7,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.UNPAID),(60,3,ExaminationOrder.Status.PUBLISHED,BillingRecord.Status.PAID)]
+        for index,(days_ago,item_index,exam_state,bill_state) in enumerate(recent_samples):
+            record=records[index%18];item=exam_items[item_index];visit_day=today-timedelta(days=days_ago)
+            order=ExaminationOrder.objects.create(patient=patients[0],doctor=record.appointment.doctor,record=record,item=item,item_name_snapshot=item.name,price_snapshot=item.price,type=type_map[item.category],status=exam_state,clinical_question='近期复查（虚构演示）',completed_at=timezone.make_aware(datetime.combine(visit_day,time(9))) if exam_state in {ExaminationOrder.Status.PUBLISHED,ExaminationOrder.Status.COMPLETED} else None)
+            bill=BillingRecord.objects.create(patient=patients[0],appointment=record.appointment,examination=order,category=BillingRecord.Category.EXAMINATION,description=f'检查 {order.order_no}：{item.name}',amount=item.price,status=bill_state,payment_method='演示支付' if bill_state==BillingRecord.Status.PAID else '',paid_at=timezone.make_aware(datetime.combine(visit_day,time(11))) if bill_state==BillingRecord.Status.PAID else None)
+            BillingRecord.objects.filter(pk=bill.pk).update(created_at=timezone.make_aware(datetime.combine(visit_day,time(10))))
+            if exam_state in {ExaminationOrder.Status.PUBLISHED,ExaminationOrder.Status.COMPLETED}:ExaminationReport.objects.create(order=order,findings='近期复查未见明显异常（虚构演示）。',conclusion='建议结合临床随诊。',status=ExaminationReport.Status.PUBLISHED if exam_state==ExaminationOrder.Status.PUBLISHED else ExaminationReport.Status.DRAFT,published_by=admin if exam_state==ExaminationOrder.Status.PUBLISHED else None,published_at=timezone.make_aware(datetime.combine(visit_day,time(12))) if exam_state==ExaminationOrder.Status.PUBLISHED else None)
             examinations.append(order)
         attachments=[('demo-report-1.pdf',b'%PDF-1.4\n% Fictional demo medical report\n%%EOF','pdf'),('demo-image-1.png',b'\x89PNG\r\n\x1a\nDEMO-FICTIONAL','png'),('demo-image-2.png',b'\x89PNG\r\n\x1a\nDEMO-FICTIONAL','png')]
         for order,(name,content,kind) in zip(examinations[:3],attachments):
             file=MedicalFile(order=order,original_name='虚构演示资料-'+name,file_type=kind,size=len(content),uploaded_by=admin);file.file.save(name,ContentFile(content),save=True)
-        for i in range(8):
-            record=records[i];bed=beds[i];admitted=now-timedelta(days=2+i);state=InpatientAdmission.Status.ADMITTED if i<4 else InpatientAdmission.Status.DISCHARGED;admission=InpatientAdmission.objects.create(patient=record.appointment.patient,attending_doctor=record.appointment.doctor,department=bed.department,appointment=record.appointment,bed=bed,ward=bed.ward_name,bed_no=bed.bed_no,daily_rate_snapshot=bed.daily_rate,admission_diagnosis=record.diagnosis,status=state,admitted_at=admitted,discharged_at=now-timedelta(days=i-3) if state==InpatientAdmission.Status.DISCHARGED else None,discharge_summary='病情好转，遵医嘱出院。' if state==InpatientAdmission.Status.DISCHARGED else '')
-            if state==InpatientAdmission.Status.ADMITTED:bed.is_occupied=True;bed.save(update_fields=['is_occupied','updated_at'])
-            else:BillingRecord.objects.create(patient=admission.patient,appointment=admission.appointment,admission=admission,category=BillingRecord.Category.INPATIENT,description=f'{bed} 住院费',amount=bed.daily_rate*(i-1),status=BillingRecord.Status.PAID if i<6 else BillingRecord.Status.UNPAID,payment_method='演示支付' if i<6 else '',paid_at=now-timedelta(days=i-3) if i<6 else None)
+        for i,admission in enumerate(admissions[:4]):
+            BillingRecord.objects.create(patient=admission.patient,appointment=admission.appointment,inpatient_admission=admission,category=BillingRecord.Category.OTHER,description='住院期间护理与耗材费',amount=Decimal('45.00')+i*5,status=BillingRecord.Status.UNPAID)
         for i in range(4):BillingRecord.objects.create(patient=patients[i],appointment=appointments[i],category=BillingRecord.Category.REGISTRATION,description='普通门诊挂号费',amount='20.00',status=BillingRecord.Status.PAID,payment_method='演示支付',paid_at=now-timedelta(days=i))
         actions=['login','read','create','update','confirm','pay','publish','admit']
         for i in range(40):AuditLog.objects.create(user=[admin,doctors[0].user,patients[0].user][i%3],action=actions[i%len(actions)],resource=['auth','patient','medical_record','billing','examination','inpatient'][i%6],object_id=str(i+1),description=f'演示操作记录 {i+1}')
         AIService.objects.create(name='医学影像智能分析',service_type='medical_imaging_analysis',description='仅保留接口，未配置真实模型。',is_enabled=False)
-        self.stdout.write(self.style.SUCCESS(f'演示数据已重建：10 科室 / 6 医师 / 12 患者 / {len(appointments)} 预约 / {len(records)} 病历 / {len(prescriptions)} 处方 / {len(examinations)} 检查。'))
+        self.stdout.write(self.style.SUCCESS(f'演示数据已重建：10 科室 / 6 医师 / 12 患者 / {len(appointments)} 预约 / {len(records)} 病历 / {len(prescriptions)} 处方 / {len(examinations)} 检查 / {len(admissions)} 次住院。'))
