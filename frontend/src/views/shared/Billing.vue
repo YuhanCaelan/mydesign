@@ -25,7 +25,17 @@ const categories=[['registration','挂号费'],['examination','检查费'],['med
 
 function errorText(e:any,fallback:string){const errors=e.response?.data?.errors;if(errors){const first=Object.values(errors)[0] as string|string[]|undefined;if(first)return Array.isArray(first)?first.join('；'):String(first)}return e.response?.data?.detail||fallback}
 function inpatientPath(row:BillingRecord){if(!row.admission_id)return'';const prefix=auth.user?.role==='admin'?'/console/inpatients':auth.user?.role==='doctor'?'/doctor/inpatients':'/patient/inpatients';return`${prefix}/${row.admission_id}`}
-function sourcePath(row:BillingRecord){if(row.source_type==='examination')return auth.user?.role==='admin'?'/console/clinical?tab=examinations':auth.user?.role==='doctor'?'/doctor/clinical?tab=examinations':'/patient/care?tab=reports';if(row.source_type==='admission')return auth.user?.role==='admin'?'/console/inpatient?tab=admissions':auth.user?.role==='doctor'?'/doctor/inpatient?tab=admissions':'/patient/care?tab=admissions';if(row.source_type==='prescription')return auth.user?.role==='patient'?'/patient/care?tab=prescriptions':auth.user?.role==='doctor'?'/doctor/clinical?tab=prescriptions':'';return''}
+function sourcePath(row:BillingRecord){
+  if(row.source_type==='examination'){
+    const report=row.examination_no?`&report=${row.examination_no}`:''
+    if(auth.user?.role==='admin')return'/console/clinical?tab=examinations'
+    if(auth.user?.role==='doctor')return`/doctor/records?patient=${row.patient_id}&tab=reports${report}`
+    return`/patient/records?tab=reports${report}`
+  }
+  if(row.source_type==='admission')return auth.user?.role==='admin'?'/console/inpatient?tab=admissions':auth.user?.role==='doctor'?'/doctor/inpatient?tab=admissions':'/patient/care?tab=admissions'
+  if(row.source_type==='prescription')return auth.user?.role==='patient'?'/patient/care?tab=prescriptions':auth.user?.role==='doctor'?'/doctor/clinical?tab=prescriptions':''
+  return''
+}
 async function loadAdmissions(){admissions.value=[];form.admission_id=null;if(!form.patient_id)return;try{admissions.value=await getActiveAdmissions(form.patient_id)}catch{admissions.value=[]}}
 async function load(){loading.value=true;billsError.value='';try{const data=await getBills({status:billState.status||undefined,search:billState.search||undefined,page:billState.page});rows.value=data.results;total.value=data.count}catch(e:any){rows.value=[];total.value=0;billsError.value=errorText(e,'账单加载失败')}finally{loading.value=false}}
 function searchBills(){billState.page=1;load()}

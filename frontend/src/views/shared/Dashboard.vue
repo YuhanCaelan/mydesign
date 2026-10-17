@@ -31,8 +31,8 @@ const copy=computed(()=>({
 }[role.value]))
 const quick=computed(()=>({
   admin:[['人员与科室','/console/people?tab=doctors'],['排班设置','/console/outpatient?tab=schedules'],['检查管理','/console/clinical?tab=examinations'],['费用结算','/console/operations?tab=bills']],
-  doctor:[['开始接诊','/doctor/outpatient?tab=appointments'],['书写病历','/doctor/clinical?tab=records'],['检查协作','/doctor/clinical?tab=examinations'],['住院管理','/doctor/inpatient?tab=admissions']],
-  patient:[['预约挂号','/patient/visits?tab=appointments'],['检查报告','/patient/care?tab=reports'],['查看账单','/patient/finance?tab=bills'],['我的处方','/patient/care?tab=prescriptions']]
+  doctor:[['开始接诊','/doctor/outpatient?tab=appointments'],['诊疗档案','/doctor/records'],['书写病历','/doctor/clinical?tab=records'],['检查协作','/doctor/clinical?tab=examinations'],['住院管理','/doctor/inpatient?tab=admissions']],
+  patient:[['预约挂号','/patient/visits?tab=appointments'],['历史病历','/patient/records?tab=records'],['检查报告','/patient/records?tab=reports'],['查看账单','/patient/finance?tab=bills'],['我的处方','/patient/care?tab=prescriptions']]
 }[role.value]))
 function openActivity(item:RecentActivity){
   if(role.value==='doctor')router.push({path:`/doctor/visits/${item.id}`,query:{returnTo:'/dashboard'}})
@@ -98,7 +98,7 @@ onMounted(load)
           <ol class="clinical-timeline"><li v-for="item in data?.today_schedule" :key="item.id" role="link" tabindex="0" @click="openVisit(item.id)" @keyup.enter="openVisit(item.id)"><time>{{item.time}}</time><span/><div><b>{{item.patient}}</b><p>{{item.reason||'未填写就诊原因'}}</p></div><em :class="statusTone('appointment',item.status)">{{item.status_label}}</em></li></ol>
         </ChartPanel>
         <ChartPanel class="span-7" title="全院检查协作队列" description="所有医师均可参与处理待检查项目" :empty="!data?.examination_queue?.length">
-          <div class="queue-list"><router-link v-for="item in data?.examination_queue" :key="item.id" to="/doctor/clinical?tab=examinations"><span class="queue-number">{{item.number}}</span><b>{{item.patient}}</b><span>{{item.type}}</span><em :class="statusTone('examination',item.status)">{{item.status_label}}</em></router-link></div>
+          <div class="queue-list"><router-link v-for="item in data?.examination_queue" :key="item.id" :to="item.patient_id?{path:'/doctor/records',query:{tab:'reports',patient:item.patient_id}}:{path:'/doctor/records',query:{tab:'reports'}}"><span class="queue-number">{{item.number}}</span><b>{{item.patient}}</b><span>{{item.type}}</span><em :class="statusTone('examination',item.status)">{{item.status_label}}</em></router-link></div>
         </ChartPanel>
         <ChartPanel class="span-5" title="诊疗状态" description="当前周期内个人预约构成，占比分母为本人全部预约"><StatusMatrix :items="data?.appointment_status||[]"/></ChartPanel>
       </div>

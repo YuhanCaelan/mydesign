@@ -52,7 +52,7 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
     </div>
     <template v-if="data">
       <div class="patient-band">
-        <div><span>患者</span><strong>{{data.patient.full_name}}</strong><small>{{data.patient.patient_no}} · {{data.patient.gender_display||'未填写'}} · {{data.patient.phone||'无手机号'}}</small></div>
+        <div><span>患者</span><strong>{{data.patient.full_name}}</strong><small>{{data.patient.patient_no}} · {{data.patient.gender_display||'未填写'}} · {{data.patient.phone||'无手机号'}}</small><router-link class="patient-band-link" :to="{path:'/doctor/records',query:{patient:data.patient.id,tab:'records'}}">诊疗档案 →</router-link></div>
         <div><span>过敏史</span><b>{{data.patient.allergies||'无已知过敏'}}</b></div>
         <div><span>既往病史</span><b>{{data.patient.medical_history||'未记录'}}</b></div>
         <div><span>本次就诊原因</span><b>{{data.appointment.reason}}</b></div>
@@ -84,6 +84,7 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
               <el-input v-model="historyFilters.diagnosis" clearable placeholder="诊断" style="width:140px" @keyup.enter="loadHistory(1)"/>
               <el-input v-model="historyFilters.search" clearable placeholder="病历号 / 主诉" style="width:180px" @keyup.enter="loadHistory(1)"/>
               <el-button @click="loadHistory(1)">查询</el-button><el-button link @click="resetHistory">重置</el-button>
+              <router-link :to="{path:'/doctor/records',query:{patient:data.patient.id,tab:'records'}}"><el-button link type="primary">诊疗档案 →</el-button></router-link>
               <span class="workflow-hint">已确认病历 {{history?.count||0}} 份</span>
             </div>
             <div v-loading="historyLoading" class="history-board">
@@ -118,6 +119,7 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
             <div class="table-tools">
               <el-select v-model="examStatus" clearable placeholder="全部状态" style="width:160px" @change="loadExams(1)"><el-option label="已申请" value="requested"/><el-option label="检查中" value="in_progress"/><el-option label="报告待发布" value="completed"/><el-option label="已发布" value="published"/><el-option label="已取消" value="cancelled"/></el-select>
               <el-button @click="loadExams(1)">刷新</el-button>
+              <router-link :to="{path:'/doctor/records',query:{patient:data.patient.id,tab:'reports'}}"><el-button link type="primary">在诊疗档案中查看 →</el-button></router-link>
               <span class="workflow-hint">报告与附件按当前业务权限展示；未发布报告不会向患者提前展示。</span>
             </div>
             <el-table v-loading="examLoading" :data="exams?.results||[]" empty-text="暂无历史检查">

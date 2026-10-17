@@ -1,4 +1,4 @@
-import {Calendar,DataAnalysis,Document,FirstAidKit,House,Money,OfficeBuilding,Reading,User} from '@element-plus/icons-vue'
+import {Calendar,DataAnalysis,Document,Files,FirstAidKit,House,Money,OfficeBuilding,Reading,User} from '@element-plus/icons-vue'
 import type {UserRole} from '../stores/auth'
 
 export interface NavItem{label:string;path:string;icon:unknown}
@@ -18,6 +18,7 @@ const roleMenus:Record<UserRole,NavGroup[]>={
   doctor:[
     {label:'诊疗工作',items:[
       {label:'门诊工作',path:'/doctor/outpatient',icon:Calendar},
+      {label:'诊疗档案',path:'/doctor/records',icon:Files},
       {label:'诊疗资料',path:'/doctor/clinical',icon:Document},
       {label:'住院工作',path:'/doctor/inpatient',icon:OfficeBuilding},
     ]},
@@ -25,6 +26,7 @@ const roleMenus:Record<UserRole,NavGroup[]>={
   patient:[
     {label:'个人医疗',items:[
       {label:'预约就诊',path:'/patient/visits',icon:Calendar},
+      {label:'诊疗档案',path:'/patient/records',icon:Files},
       {label:'我的医疗',path:'/patient/care',icon:Reading},
       {label:'我的费用',path:'/patient/finance',icon:Money},
     ]},

@@ -31,7 +31,7 @@ onMounted(load)
 
 <template>
   <section>
-    <div class="page-heading"><div><p class="eyebrow">ELECTRONIC MEDICAL RECORD</p><h1>{{isDoctor?'电子病历':'我的病历'}}</h1><p>{{isDoctor?'记录诊疗信息，确认病历后完成并归档本次诊疗':'查看医师已经确认的个人就诊记录'}}</p></div><el-button v-if="isDoctor" type="primary" @click="openCreate">＋ 创建病历</el-button></div>
+    <div class="page-heading"><div><p class="eyebrow">ELECTRONIC MEDICAL RECORD</p><h1>{{isDoctor?'电子病历':'我的病历'}}</h1><p>{{isDoctor?'记录诊疗信息，确认病历后完成并归档本次诊疗':'查看医师已经确认的个人就诊记录'}}</p></div><div class="heading-actions"><router-link v-if="isDoctor" to="/doctor/records?tab=records"><el-button>诊疗档案</el-button></router-link><el-button v-if="isDoctor" type="primary" @click="openCreate">＋ 创建病历</el-button></div></div>
     <el-alert v-if="isDoctor" title="已确认病历不可直接覆盖；确认后可点击“完成诊疗”结束本次就诊" type="info" :closable="false" show-icon class="record-alert"/>
     <el-card class="table-card">
       <div class="table-tools"><span class="table-count">按就诊时间排列 · 共 {{total}} 条</span><ViewSwitch v-model="state.view"/></div>

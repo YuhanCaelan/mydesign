@@ -39,7 +39,7 @@ onMounted(load)
 
 <template>
   <section>
-    <div class="page-heading"><div><p class="eyebrow">MEDICAL EXAMINATION</p><h1>{{role==='doctor'?'医学检查':role==='patient'?'检查报告':'检查管理'}}</h1><p>{{role==='doctor'?'创建检查申请，录入检查结果并向患者发布报告':role==='patient'?'查看已经发布的个人检查结果和附件':'审核、录入并发布检查报告'}}</p></div><el-button v-if="role==='doctor'" type="primary" @click="openCreate">＋ 申请检查</el-button></div>
+    <div class="page-heading"><div><p class="eyebrow">MEDICAL EXAMINATION</p><h1>{{role==='doctor'?'医学检查':role==='patient'?'检查报告':'检查管理'}}</h1><p>{{role==='doctor'?'创建检查申请，录入检查结果并向患者发布报告':role==='patient'?'查看已经发布的个人检查结果和附件':'审核、录入并发布检查报告'}}</p></div><div class="heading-actions"><router-link v-if="role==='doctor'" to="/doctor/records?tab=reports"><el-button>诊疗档案</el-button></router-link><el-button v-if="role==='doctor'" type="primary" @click="openCreate">＋ 申请检查</el-button></div></div>
     <el-card class="table-card">
       <div class="table-tools"><el-input v-model="state.search" clearable placeholder="搜索申请单、患者或检查目的" @keyup.enter="searchOrders"/><el-select v-model="state.status" clearable placeholder="全部状态" @change="searchOrders"><el-option label="已申请" value="requested"/><el-option label="检查中" value="in_progress"/><el-option label="报告待发布" value="completed"/><el-option label="已发布" value="published"/><el-option label="已取消" value="cancelled"/></el-select><el-button @click="searchOrders">查询</el-button><span class="table-count">共 {{total}} 条</span><ViewSwitch v-model="state.view"/></div>
       <div class="legend-row"><StatusLegend domain="examination" title="检查状态"/></div>
@@ -50,7 +50,7 @@ onMounted(load)
           <div class="task-card-grid">
             <TaskCard v-for="row in group.items" :key="row.id" :time="row.created_at?.replace('T',' ').slice(0,16)" :title="row.item_name_snapshot||'检查申请'" :subtitle="`${row.order_no} · ${role==='patient'?row.doctor_name:row.patient_name}`" :accent="group.info.tone" :highlight="row.status==='completed'" :meta="[{label:'检查类型',value:row.type_display},{label:'费用',value:row.price_snapshot?`¥${row.price_snapshot}`:'无目录费用'},{label:'检查目的',value:row.clinical_question}]">
               <template #status><el-tag :type="group.info.tone">{{group.info.label}}</el-tag></template>
-              <template #actions><el-button link type="primary" @click="view(row)">查看</el-button><template v-if="role==='admin'||role==='doctor'"><el-button v-if="row.status==='requested'" link @click="start(row)">开始检查</el-button><el-button v-if="row.status==='requested'||row.status==='in_progress'||row.status==='completed'" link @click="openReport(row)">{{row.report?'编辑报告':'录入报告'}}</el-button><el-button v-if="row.status==='completed'" link type="success" @click="publish(row)">发布</el-button></template></template>
+              <template #actions><el-button link type="primary" @click="view(row)">查看</el-button><router-link v-if="role==='doctor'&&row.patient_id" :to="{path:'/doctor/records',query:{patient:row.patient_id,tab:'reports'}}"><el-button link type="primary">档案</el-button></router-link><template v-if="role==='admin'||role==='doctor'"><el-button v-if="row.status==='requested'" link @click="start(row)">开始检查</el-button><el-button v-if="row.status==='requested'||row.status==='in_progress'||row.status==='completed'" link @click="openReport(row)">{{row.report?'编辑报告':'录入报告'}}</el-button><el-button v-if="row.status==='completed'" link type="success" @click="publish(row)">发布</el-button></template></template>
             </TaskCard>
           </div>
         </section>
@@ -60,7 +60,7 @@ onMounted(load)
         <el-table v-loading="loading" :data="rows" empty-text="暂无检查记录" class="desktop-table">
           <el-table-column type="expand"><template #default="{row}"><div class="record-detail exam-expand"><div><span>检查目的与临床问题</span><p>{{row.clinical_question}}</p></div><div><span>检查类型与费用</span><b>{{row.type_display}} · {{row.price_snapshot?`¥${row.price_snapshot}`:'无目录费用'}}</b></div><div><span>费用归属</span><b>{{row.admission_no?`住院 ${row.admission_no}`:'门诊费用'}}</b></div></div></template></el-table-column>
           <el-table-column prop="order_no" label="申请单号" min-width="145"/>
-          <el-table-column v-if="role!=='patient'" prop="patient_name" label="患者" min-width="105"/>
+          <el-table-column v-if="role!=='patient'" label="患者" min-width="115"><template #default="{row}"><router-link v-if="role==='doctor'&&row.patient_id" class="source-link" :to="{path:'/doctor/records',query:{patient:row.patient_id,tab:'reports'}}">{{row.patient_name}}</router-link><span v-else>{{row.patient_name}}</span></template></el-table-column>
           <el-table-column v-else prop="doctor_name" label="医师" min-width="105"/>
           <el-table-column prop="item_name_snapshot" label="检查项目" min-width="150"><template #default="{row}">{{row.item_name_snapshot||'未指定目录项目'}}</template></el-table-column>
           <el-table-column label="申请时间" min-width="150"><template #default="{row}">{{row.created_at?.replace('T',' ').slice(0,16)}}</template></el-table-column>
@@ -73,7 +73,7 @@ onMounted(load)
             <p class="mobile-sub">{{row.order_no}} · {{role==='patient'?row.doctor_name:row.patient_name}}</p>
             <div class="mobile-line"><span>申请时间</span><b>{{row.created_at?.replace('T',' ').slice(0,16)}}</b></div>
             <div class="mobile-line"><span>检查目的</span><b>{{row.clinical_question}}</b></div>
-            <div class="actions"><el-button link type="primary" @click="view(row)">查看</el-button><template v-if="role==='admin'||role==='doctor'"><el-button v-if="row.status==='requested'" link @click="start(row)">开始检查</el-button><el-button v-if="row.status==='requested'||row.status==='in_progress'||row.status==='completed'" link @click="openReport(row)">{{row.report?'编辑报告':'录入报告'}}</el-button><el-button v-if="row.status==='completed'" link type="success" @click="publish(row)">发布</el-button></template></div>
+            <div class="actions"><el-button link type="primary" @click="view(row)">查看</el-button><router-link v-if="role==='doctor'&&row.patient_id" :to="{path:'/doctor/records',query:{patient:row.patient_id,tab:'reports'}}"><el-button link type="primary">档案</el-button></router-link><template v-if="role==='admin'||role==='doctor'"><el-button v-if="row.status==='requested'" link @click="start(row)">开始检查</el-button><el-button v-if="row.status==='requested'||row.status==='in_progress'||row.status==='completed'" link @click="openReport(row)">{{row.report?'编辑报告':'录入报告'}}</el-button><el-button v-if="row.status==='completed'" link type="success" @click="publish(row)">发布</el-button></template></div>
           </article>
           <div v-if="!rows.length&&!loading" class="mobile-empty">暂无检查记录</div>
         </div>

@@ -22,7 +22,6 @@ const legacyRoutes:Record<string,{path:string;tab?:string}>={
   '/doctor/schedule':{path:'/doctor/outpatient',tab:'schedule'},
   '/doctor/appointments':{path:'/doctor/outpatient',tab:'appointments'},
   '/doctor/patients':{path:'/doctor/outpatient',tab:'patients'},
-  '/doctor/records':{path:'/doctor/clinical',tab:'records'},
   '/doctor/prescriptions':{path:'/doctor/clinical',tab:'prescriptions'},
   '/doctor/examinations':{path:'/doctor/clinical',tab:'examinations'},
   '/doctor/medicines':{path:'/doctor/clinical',tab:'medicines'},
@@ -30,14 +29,16 @@ const legacyRoutes:Record<string,{path:string;tab?:string}>={
   '/doctor/inpatients':{path:'/doctor/inpatient',tab:'admissions'},
   '/patient/doctors':{path:'/patient/visits',tab:'doctors'},
   '/patient/appointments':{path:'/patient/visits',tab:'appointments'},
-  '/patient/records':{path:'/patient/care',tab:'records'},
   '/patient/prescriptions':{path:'/patient/care',tab:'prescriptions'},
-  '/patient/reports':{path:'/patient/care',tab:'reports'},
   '/patient/inpatients':{path:'/patient/care',tab:'admissions'},
   '/patient/billing':{path:'/patient/finance',tab:'bills'},
 }
 
 function legacyRedirect(path:string,query:LocationQueryRaw):{path:string;query:LocationQueryRaw}|null{
+  if(path==='/patient/care'){
+    const tab=typeof query.tab==='string'?query.tab:''
+    if(tab==='records'||tab==='reports')return{path:'/patient/records',query:{...query,tab}}
+  }
   if(path==='/console/resources'){
     const oldTab=typeof query.tab==='string'?query.tab:'beds'
     const target=oldTab==='exams'?{path:'/console/clinical',tab:'exam-items'}:oldTab==='movements'?{path:'/console/clinical',tab:'stock'}:{path:'/console/inpatient',tab:'bed-config'}
@@ -54,6 +55,8 @@ const legacyRouteRecords:RouteRecordRaw[]=Object.entries(legacyRoutes).map(([pat
 }))
 legacyRouteRecords.push(
   {path:'/console/resources',redirect:to=>legacyRedirect('/console/resources',to.query)||'/dashboard'},
+  {path:'/patient/reports',redirect:to=>({path:'/patient/records',query:{...to.query,tab:'reports'}})},
+  {path:'/doctor/reports',redirect:to=>({path:'/doctor/records',query:{...to.query,tab:'reports'}})},
   {path:'/smart/services',redirect:to=>{
     const auth=useAuthStore(),role=auth.user?.role
     const target=role==='admin'?{path:'/console/clinical',tab:'smart'}:role==='doctor'?{path:'/doctor/clinical',tab:'smart'}:{path:'/patient/care',tab:'smart'}
@@ -76,12 +79,14 @@ const routes:RouteRecordRaw[]=[
     route('/console/inpatients/:admissionId','admin-inpatient-detail','shared/AdmissionDetail',['admin'],{activePath:'/console/inpatient'}),
     // 医师主栏目
     route('/doctor/outpatient','doctor-outpatient','doctor/Outpatient',['doctor']),
+    route('/doctor/records','doctor-records','shared/Archive',['doctor']),
     route('/doctor/clinical','doctor-clinical','doctor/Clinical',['doctor']),
     route('/doctor/inpatient','doctor-inpatient','doctor/Inpatient',['doctor']),
     route('/doctor/visits/:appointmentId','doctor-visit-workspace','doctor/VisitWorkspace',['doctor'],{activePath:'/doctor/outpatient'}),
     route('/doctor/inpatients/:admissionId','doctor-inpatient-detail','shared/AdmissionDetail',['doctor'],{activePath:'/doctor/inpatient'}),
     // 患者主栏目
     route('/patient/visits','patient-visits','patient/Visits',['patient']),
+    route('/patient/records','patient-records','shared/Archive',['patient']),
     route('/patient/care','patient-care','patient/Care',['patient']),
     route('/patient/finance','patient-finance','patient/Finance',['patient']),
     route('/patient/inpatients/:admissionId','patient-inpatient-detail','shared/AdmissionDetail',['patient'],{activePath:'/patient/care'}),

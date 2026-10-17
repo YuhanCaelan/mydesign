@@ -9,6 +9,6 @@ export interface DashboardData{
   kpis:DashboardKpi[];timeseries:TimeSeriesPoint[];appointment_status:NamedValue[];recent_activity:RecentActivity[];alerts:DashboardAlert[]
   department_workload?:NamedValue[];doctor_workload?:NamedValue[];billing_categories?:NamedValue[];inpatient_status?:NamedValue[];workflow?:NamedValue[]
   today_schedule?:{id:number;time:string;patient:string;reason:string;status:string;status_label:string}[]
-  examination_queue?:{id:number;number:string;patient:string;type:string;status:string;status_label:string;created_at:string}[]
+  examination_queue?:{id:number;number:string;patient:string;patient_id?:number;type:string;status:string;status_label:string;created_at:string}[]
   next_appointment?:RecentActivity|null
 }
