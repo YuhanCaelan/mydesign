@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import *
-from .services import book_appointment,generate_slots,link_inpatient
+from .services import book_appointment,bookable_slots,generate_slots,link_inpatient
 
 class SessionUserSerializer(serializers.ModelSerializer):
     full_name=serializers.SerializerMethodField();avatar=serializers.SerializerMethodField()
@@ -130,14 +130,17 @@ class AdminUserSerializer(serializers.ModelSerializer):
 
 class SlotSerializer(serializers.ModelSerializer):
     date=serializers.DateField(source='schedule.date',read_only=True);doctor_id=serializers.IntegerField(source='schedule.doctor_id',read_only=True)
-    class Meta:model=AppointmentSlot;fields=('id','doctor_id','date','start_time','end_time','status')
+    class Meta:model=AppointmentSlot;fields=('id','schedule_id','doctor_id','date','start_time','end_time','status')
 
 class ScheduleSerializer(serializers.ModelSerializer):
     doctor_name=serializers.CharField(source='doctor.user.get_full_name',read_only=True);doctor_title=serializers.CharField(source='doctor.title',read_only=True);doctor_specialty=serializers.CharField(source='doctor.specialty',read_only=True);department_id=serializers.IntegerField(source='doctor.department_id',read_only=True);department_name=serializers.CharField(source='doctor.department.name',read_only=True)
     time_range=serializers.SerializerMethodField();total_slots=serializers.IntegerField(source='slots.count',read_only=True);available_slots=serializers.SerializerMethodField();booked_slots=serializers.SerializerMethodField()
     class Meta:model=DoctorSchedule;fields=('id','doctor','doctor_name','doctor_title','doctor_specialty','department_id','department_name','date','start_time','end_time','time_range','slot_minutes','is_active','total_slots','available_slots','booked_slots','created_at');read_only_fields=('created_at',)
     def get_time_range(self,obj):return f'{obj.start_time:%H:%M}–{obj.end_time:%H:%M}'
-    def get_available_slots(self,obj):return obj.slots.filter(status=AppointmentSlot.Status.AVAILABLE).count()
+    def get_available_slots(self,obj):
+        request=self.context.get('request')
+        if request and request.user.role==User.Role.PATIENT:return bookable_slots(obj.slots.all()).count()
+        return obj.slots.filter(status=AppointmentSlot.Status.AVAILABLE).count()
     def get_booked_slots(self,obj):return obj.slots.filter(status=AppointmentSlot.Status.BOOKED).count()
     def validate(self,data):
         doctor=data.get('doctor',getattr(self.instance,'doctor',None));day=data.get('date',getattr(self.instance,'date',None));start=data.get('start_time',getattr(self.instance,'start_time',None));end=data.get('end_time',getattr(self.instance,'end_time',None))

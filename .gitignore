@@ -5,7 +5,6 @@ media/
 smartmedical_media/
 smartmedical_static/
 frontend/node_modules/
-frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
 .DS_Store

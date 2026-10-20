@@ -1,0 +1,1 @@
+import{Q as e,lt as t}from"./api-Csx0eSaU.js";function n(n,r){let i=`smartmedical:list:${n}`,a={...r};try{let e=sessionStorage.getItem(i);e&&Object.assign(a,JSON.parse(e))}catch{}let o=t(a);return e(o,()=>{try{sessionStorage.setItem(i,JSON.stringify(o))}catch{}},{deep:!0}),o}function r(e){try{sessionStorage.removeItem(`smartmedical:list:${e}`)}catch{}}export{n,r as t};

@@ -20,10 +20,17 @@ def generate_slots(schedule:DoctorSchedule):
         cursor=slot_end
     AppointmentSlot.objects.bulk_create(slots,ignore_conflicts=True)
 
+def bookable_slots(queryset):
+    """患者可选择的号源：出诊开放、医师接诊且尚未开始。"""
+    now=timezone.localtime()
+    return queryset.filter(status=AppointmentSlot.Status.AVAILABLE,schedule__is_active=True,
+                           schedule__doctor__is_available=True,schedule__doctor__user__is_active=True).filter(
+        Q(schedule__date__gt=now.date())|Q(schedule__date=now.date(),start_time__gt=now.time()))
+
 @transaction.atomic
 def book_appointment(*,patient,slot_id,reason):
-    slot=AppointmentSlot.objects.select_for_update().select_related('schedule__doctor').get(pk=slot_id)
-    if slot.status!=AppointmentSlot.Status.AVAILABLE or not slot.schedule.is_active:raise ValidationError('该号源已不可预约。')
+    slot=AppointmentSlot.objects.select_for_update().select_related('schedule__doctor__user').get(pk=slot_id)
+    if slot.status!=AppointmentSlot.Status.AVAILABLE or not slot.schedule.is_active or not slot.schedule.doctor.is_available or not slot.schedule.doctor.user.is_active:raise ValidationError('该号源已不可预约。')
     start=datetime.combine(slot.schedule.date,slot.start_time)
     if timezone.make_aware(start)<=timezone.now():raise ValidationError('不能预约已经开始的号源。')
     appointment=Appointment.objects.create(patient=patient,doctor=slot.schedule.doctor,department=slot.schedule.doctor.department,slot=slot,reason=reason)

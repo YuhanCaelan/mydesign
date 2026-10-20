@@ -2,13 +2,15 @@
 import{computed,onMounted,reactive,ref,watch}from'vue'
 import{useRouter}from'vue-router'
 import{ElMessage}from'element-plus'
-import{createSchedule,getDoctorsAdmin,getOutpatientVisits,getSchedules,updateSchedule,type Schedule}from'../../services/admin'
+import{createSchedule,getDoctorsAdmin,getAllScheduleDoctors,getAllScheduleDepartments,getOutpatientVisits,getAllSchedules,updateSchedule,type Schedule}from'../../services/admin'
 import{getOperationDepartments}from'../../services/operations'
 import api from'../../services/api'
 import{useAuthStore}from'../../stores/auth'
 import{useListState}from'../../composables/useListState'
 import ListError from'../../components/common/ListError.vue'
 import StatusLegend from'../../components/common/StatusLegend.vue'
+import ScheduleCalendar from'../../components/schedules/ScheduleCalendar.vue'
+import{localDate}from'../../utils/scheduleCalendar'
 import{statusInfo,statusTone}from'../../utils/status'
 import type{Department,DoctorSummary,MedicalRecord,OutpatientResult,OutpatientSlot}from'../../types/medical'
 
@@ -16,11 +18,15 @@ type ViewMode='schedules'|'visits'
 const props=defineProps<{view?:ViewMode}>()
 const auth=useAuthStore(),router=useRouter(),isDoctor=computed(()=>auth.user?.role==='doctor')
 const showTabs=computed(()=>!props.view),active=ref<'settings'|'visits'>(props.view==='visits'?'visits':'settings')
-const today=new Date().toISOString().slice(0,10)
+const today=localDate()
+const calendar=reactive({month:today.slice(0,7),selectedDate:today,department:undefined as number|undefined,doctor:undefined as number|undefined,status:''})
+const scheduleDoctors=ref<DoctorSummary[]>([]),optionsLoading=ref(false),optionsError=ref(''),pendingIds=ref<number[]>([])
+const scheduleDepartments=ref<Department[]>([])
+let loadVersion=0
 const filters=useListState(`schedules-visits-${auth.user?.role||'guest'}`,{date:today,department:undefined as number|undefined,doctor:undefined as number|undefined,status:'',page:1,pageSize:10})
 const rows=ref<Schedule[]>([]),doctors=ref<DoctorSummary[]>([]),departments=ref<Department[]>([]),loading=ref(false),error=ref(''),dialog=ref(false),saving=ref(false)
 const form=reactive({doctor:0,date:'',start_time:'09:00',end_time:'12:00',slot_minutes:30})
-const minDate=new Date().toISOString().slice(0,10)
+function disabledScheduleDate(date:Date){return localDate(date)<localDate()}
 const visitsLoading=ref(false),visits=ref<OutpatientResult|null>(null),visitsError=ref('')
 const detailOpen=ref(false),selected=ref<OutpatientSlot|null>(null),recordDetail=ref<MedicalRecord|null>(null),recordLoading=ref(false)
 const statusOptions=[['available','可预约'],['pending','待就诊'],['in_progress','就诊中'],['completed','已完成'],['cancelled','已取消'],['no_show','爽约'],['closed','已关闭']]
@@ -29,19 +35,34 @@ const weekdays=['周日','周一','周二','周三','周四','周五','周六']
 const visitDates=computed(()=>Array.from({length:7},(_,offset)=>{const date=new Date();date.setDate(date.getDate()+offset);const value=[date.getFullYear(),String(date.getMonth()+1).padStart(2,'0'),String(date.getDate()).padStart(2,'0')].join('-');return{value,weekday:offset===0?'今天':weekdays[date.getDay()],day:date.getDate(),month:date.getMonth()+1}}))
 function pickVisitDate(value:string){if(filters.date===value)return;filters.date=value;searchVisits()}
 
-function errorText(e:any,fallback:string){return e.response?.data?.detail||fallback}
+function errorText(e:any,fallback:string){
+  const data=e.response?.data
+  function messages(value:unknown):string[]{
+    if(typeof value==='string')return[value]
+    if(Array.isArray(value))return value.flatMap(messages)
+    if(value&&typeof value==='object')return Object.values(value).flatMap(messages)
+    return[]
+  }
+  return messages(data?.errors).join('；')||data?.detail||fallback
+}
 function slotInfo(slot:OutpatientSlot){return slot.appointment?statusInfo('appointment',slot.state):statusInfo('slot',slot.slot_status)}
-async function load(){loading.value=true;error.value='';try{rows.value=(await getSchedules()).results}catch(e:any){rows.value=[];error.value=errorText(e,'排班加载失败')}finally{loading.value=false}}
+async function load(){const version=++loadVersion;loading.value=true;error.value='';try{const data=await getAllSchedules();if(version===loadVersion)rows.value=data}catch(e:any){if(version===loadVersion){rows.value=[];error.value=errorText(e,'排班加载失败')}}finally{if(version===loadVersion)loading.value=false}}
+async function loadScheduleDoctors(){if(isDoctor.value)return;optionsLoading.value=true;optionsError.value='';try{const [doctorOptions,departmentOptions]=await Promise.all([getAllScheduleDoctors(),getAllScheduleDepartments()]);scheduleDoctors.value=doctorOptions;scheduleDepartments.value=departmentOptions}catch(e:any){scheduleDoctors.value=[];scheduleDepartments.value=[];optionsError.value=errorText(e,'排班筛选选项加载失败，请重试')}finally{optionsLoading.value=false}}
 async function loadFilters(){try{departments.value=await getOperationDepartments()}catch{departments.value=[]}}
 async function loadDoctorOptions(){if(isDoctor.value)return;try{doctors.value=await getDoctorsAdmin({department:filters.department})}catch{doctors.value=[]}}
 async function loadVisits(){visitsLoading.value=true;visitsError.value='';try{visits.value=await getOutpatientVisits({date:filters.date,department:filters.department||undefined,doctor:filters.doctor||undefined,status:filters.status||undefined,page:filters.page,page_size:filters.pageSize})}catch(e:any){visits.value=null;visitsError.value=errorText(e,'门诊就诊视图加载失败')}finally{visitsLoading.value=false}}
 function searchVisits(){filters.page=1;loadVisits()}
 function resetVisits(){Object.assign(filters,{date:today,department:undefined,doctor:undefined,status:'',page:1});loadDoctorOptions();loadVisits()}
-function changeTab(name:string|number){active.value=name==='visits'?'visits':'settings';if(active.value==='visits'){if(!departments.value.length)loadFilters();loadDoctorOptions();loadVisits()}}
-function ensureView(){if(active.value==='visits'){loadFilters();loadDoctorOptions();loadVisits()}else load()}
-async function open(){Object.assign(form,{doctor:0,date:'',start_time:'09:00',end_time:'12:00',slot_minutes:30});dialog.value=true;if(isDoctor.value)form.doctor=(await api.get('doctors/me/')).data.id;else doctors.value=await getDoctorsAdmin()}
-async function submit(){if(!form.doctor||!form.date){ElMessage.warning('请选择医师和日期');return}if(form.start_time>=form.end_time){ElMessage.warning('结束时间必须晚于开始时间');return}saving.value=true;try{await createSchedule({...form,start_time:`${form.start_time}:00`,end_time:`${form.end_time}:00`});ElMessage.success('排班和号源已生成');dialog.value=false;await load()}catch(e:any){ElMessage.error(errorText(e,'排班创建失败'))}finally{saving.value=false}}
-async function toggle(row:Schedule){try{await updateSchedule(row.id,{is_active:!row.is_active});await load()}catch(e:any){ElMessage.error(errorText(e,'排班状态更新失败'))}}
+function changeTab(name:string|number){active.value=name==='visits'?'visits':'settings';ensureView()}
+function ensureView(){if(active.value==='visits'){loadDoctorOptions();return loadVisits()}return Promise.all([load(),loadScheduleDoctors()])}
+async function open(date?:string){
+  if(optionsLoading.value)return
+  if(!isDoctor.value&&!scheduleDoctors.value.length){await loadScheduleDoctors();if(optionsError.value){ElMessage.error(optionsError.value);return}}
+  Object.assign(form,{doctor:calendar.doctor||0,date:date||(calendar.selectedDate>=localDate()?calendar.selectedDate:localDate()),start_time:'09:00',end_time:'12:00',slot_minutes:30})
+  try{if(isDoctor.value)form.doctor=(await api.get('doctors/me/')).data.id;dialog.value=true}catch(e:any){ElMessage.error(errorText(e,'医师信息加载失败'))}
+}
+async function submit(){if(!form.doctor||!form.date){ElMessage.warning('请选择医师和日期');return}if(form.date<localDate()){ElMessage.warning('不能创建过去日期的排班');return}if(!form.start_time||!form.end_time||form.start_time>=form.end_time){ElMessage.warning('结束时间必须晚于开始时间');return}saving.value=true;try{await createSchedule({...form,start_time:`${form.start_time}:00`,end_time:`${form.end_time}:00`});ElMessage.success('排班和号源已生成');dialog.value=false;calendar.month=form.date.slice(0,7);calendar.selectedDate=form.date;calendar.department=undefined;calendar.doctor=form.doctor;calendar.status='';await load()}catch(e:any){ElMessage.error(errorText(e,'排班创建失败'))}finally{saving.value=false}}
+async function toggle(row:Schedule){if(row.date<localDate()||pendingIds.value.includes(row.id))return;pendingIds.value.push(row.id);try{await updateSchedule(row.id,{is_active:!row.is_active});ElMessage.success(row.is_active?'排班已关闭':'排班已开放');await load()}catch(e:any){ElMessage.error(errorText(e,'排班状态更新失败'))}finally{pendingIds.value=pendingIds.value.filter(id=>id!==row.id)}}
 async function openSlot(slot:OutpatientSlot){if(!slot.appointment)return;selected.value=slot;recordDetail.value=null;detailOpen.value=true;const record=slot.appointment.record;if(!record)return;recordLoading.value=true;try{recordDetail.value=(await api.get(`medical-records/${record.id}/`)).data}catch{recordDetail.value=null}finally{recordLoading.value=false}}
 function enterWorkspace(){const appointment=selected.value?.appointment;if(appointment)router.push({path:`/doctor/visits/${appointment.id}`,query:{returnTo:'/doctor/outpatient?tab=visits'}})}
 function recordStatus(row:OutpatientSlot){const record=row.appointment?.record;if(!record)return'未建立';return record.status==='confirmed'?'已确认':'草稿'}
@@ -54,24 +75,14 @@ onMounted(async()=>{await Promise.all([loadFilters(),ensureView()])})
   <section>
     <div class="page-heading">
       <div><p class="eyebrow">SCHEDULE & OUTPATIENT VISITS</p><h1>{{active==='visits'?'门诊就诊':isDoctor?'我的排班':'排班设置'}}</h1><p>{{active==='visits'?'按“医师 → 排班 → 号源 → 患者”追踪预约与接诊状态':'设置医师出诊时段，系统自动生成可预约号源'}}</p></div>
-      <el-button v-if="active!=='visits'" type="primary" @click="open">＋ 新建排班</el-button>
+      <el-button v-if="active!=='visits'" type="primary" :disabled="optionsLoading" @click="open()">＋ 新建排班</el-button>
     </div>
     <div v-if="showTabs" class="inline-tabs"><el-tabs v-model="active" @tab-change="changeTab"><el-tab-pane label="排班设置" name="settings"/><el-tab-pane label="门诊就诊" name="visits"/></el-tabs></div>
 
     <div v-if="active==='settings'">
+      <ListError v-if="optionsError" :message="optionsError" @retry="loadScheduleDoctors"/>
       <ListError v-if="error" :message="error" @retry="load"/>
-      <el-card v-else class="table-card">
-        <el-table v-loading="loading" :data="rows" empty-text="暂无排班">
-          <el-table-column prop="doctor_name" label="医师"/>
-          <el-table-column prop="date" label="日期"/>
-          <el-table-column prop="time_range" label="出诊时间"/>
-          <el-table-column prop="slot_minutes" label="每号分钟"/>
-          <el-table-column prop="total_slots" label="总号源"/>
-          <el-table-column prop="available_slots" label="剩余"/>
-          <el-table-column label="状态"><template #default="{row}"><el-tag :type="row.is_active?'success':'info'">{{row.is_active?'开放':'关闭'}}</el-tag></template></el-table-column>
-          <el-table-column label="操作"><template #default="{row}"><el-button link @click="toggle(row)">{{row.is_active?'关闭':'开放'}}</el-button></template></el-table-column>
-        </el-table>
-      </el-card>
+      <ScheduleCalendar v-else v-model:month="calendar.month" v-model:selected-date="calendar.selectedDate" v-model:department="calendar.department" v-model:doctor="calendar.doctor" v-model:status="calendar.status" :rows="rows" :departments="scheduleDepartments" :doctors="scheduleDoctors" :is-doctor="isDoctor" :loading="loading" :options-loading="optionsLoading" :pending-ids="pendingIds" @create="open" @toggle="toggle" @refresh="load"/>
     </div>
 
     <div v-else>
@@ -123,8 +134,8 @@ onMounted(async()=>{await Promise.all([loadFilters(),ensureView()])})
 
     <el-dialog v-model="dialog" title="新建医师排班" width="min(560px,94vw)">
       <el-form label-position="top">
-        <el-form-item v-if="!isDoctor" label="出诊医师" required><el-select v-model="form.doctor" filterable style="width:100%"><el-option v-for="item in doctors" :key="item.id" :label="`${item.full_name} · ${item.department_name}`" :value="item.id"/></el-select></el-form-item>
-        <el-form-item label="出诊日期" required><el-date-picker v-model="form.date" value-format="YYYY-MM-DD" style="width:100%" :disabled-date="(d:Date)=>d.getTime()<new Date(minDate).setHours(0,0,0,0)"/></el-form-item>
+        <el-form-item v-if="!isDoctor" label="出诊医师" required><el-select v-model="form.doctor" filterable style="width:100%"><el-option v-for="item in scheduleDoctors" :key="item.id" :label="`${item.full_name} · ${item.department_name}`" :value="item.id"/></el-select></el-form-item>
+        <el-form-item label="出诊日期" required><el-date-picker v-model="form.date" value-format="YYYY-MM-DD" style="width:100%" :disabled-date="disabledScheduleDate"/></el-form-item>
         <el-row :gutter="12"><el-col :span="8"><el-form-item label="开始时间"><el-time-select v-model="form.start_time" start="07:00" step="00:30" end="20:00"/></el-form-item></el-col><el-col :span="8"><el-form-item label="结束时间"><el-time-select v-model="form.end_time" start="07:30" step="00:30" end="21:00"/></el-form-item></el-col><el-col :span="8"><el-form-item label="每号时长"><el-select v-model="form.slot_minutes"><el-option label="15 分钟" :value="15"/><el-option label="20 分钟" :value="20"/><el-option label="30 分钟" :value="30"/></el-select></el-form-item></el-col></el-row>
       </el-form>
       <template #footer><el-button @click="dialog=false">取消</el-button><el-button type="primary" :loading="saving" @click="submit">生成排班</el-button></template>

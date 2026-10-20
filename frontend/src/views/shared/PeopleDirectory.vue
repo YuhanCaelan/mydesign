@@ -20,7 +20,7 @@ const description=computed(()=>isPatientSearch.value?'按科室与专长查找�
 async function load(){loading.value=true;error.value='';try{const endpoint=isDoctors.value?'doctors/':'patients/';const{data}=await api.get<any[]|PageResult<any>>(endpoint,{params:{page:state.page,search:state.keyword,department:state.department||undefined}});rows.value=Array.isArray(data)?data:data.results;total.value=Array.isArray(data)?data.length:data.count}catch(e:any){rows.value=[];total.value=0;error.value=e.response?.data?.detail||'资料加载失败'}finally{loading.value=false}}
 function search(){state.page=1;load()}
 function view(row:any){detail.value=row;drawer.value=true}
-function book(row:any){router.push({path:'/patient/visits',query:{tab:'appointments',department:row.department_id,doctor:row.id}})}
+function book(row:any){router.push({path:'/patient/visits',query:{tab:'doctors',department:row.department_id,doctor:row.id}})}
 onMounted(async()=>{try{const{data}=await api.get('departments/',{params:{status:'active'}});departments.value=Array.isArray(data)?data:data.results}catch{departments.value=[]}await load()})
 </script>
 

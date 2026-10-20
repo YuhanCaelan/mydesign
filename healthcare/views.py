@@ -15,7 +15,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .models import *
 from .permissions import IsAdmin,IsAdminOrReadOnly,IsAdminWriteOrClinicalRead
 from .serializers import *
-from .services import VALID_RELATIONSHIP_STATUSES,admit_patient,audit,bed_status_key,board_bed_payload,department_scope,ensure_admission_operator,finish_admission,has_doctor_patient_relationship,link_inpatient,record_stock_movement,transition_appointment
+from .services import VALID_RELATIONSHIP_STATUSES,admit_patient,audit,bed_status_key,board_bed_payload,bookable_slots,department_scope,ensure_admission_operator,finish_admission,has_doctor_patient_relationship,link_inpatient,record_stock_movement,transition_appointment
 
 
 def parse_date_query(value,name='date',default=None):
@@ -201,7 +201,9 @@ class DoctorViewSet(viewsets.ModelViewSet):
     def slots(self,request,pk=None):
         date=request.query_params.get('date');qs=AppointmentSlot.objects.select_related('schedule').filter(schedule__doctor=self.get_object(),schedule__is_active=True,status=AppointmentSlot.Status.AVAILABLE)
         if date:qs=qs.filter(schedule__date=date)
-        qs=qs.filter(schedule__date__gte=timezone.localdate())
+        schedule_id=int_query(request.query_params.get('schedule'),'schedule',minimum=1)
+        if schedule_id is not None:qs=qs.filter(schedule_id=schedule_id)
+        qs=bookable_slots(qs).order_by('schedule__date','start_time','pk')
         return Response(SlotSerializer(qs,many=True).data)
 
 class PatientViewSet(viewsets.ModelViewSet):
@@ -259,7 +261,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs=super().get_queryset();user=self.request.user
         if user.role==User.Role.DOCTOR:qs=qs.filter(doctor__user=user)
-        elif user.role==User.Role.PATIENT:qs=qs.filter(is_active=True,date__gte=timezone.localdate())
+        elif user.role==User.Role.PATIENT:qs=qs.filter(is_active=True,date__gte=timezone.localdate(),doctor__is_available=True,doctor__user__is_active=True)
         return qs
     def perform_create(self,serializer):
         user=self.request.user

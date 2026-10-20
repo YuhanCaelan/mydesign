@@ -1,8 +1,10 @@
 import io
+from unittest.mock import patch
 from datetime import date,datetime,time,timedelta
 from decimal import Decimal
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework.test import APITestCase
 from .models import *
 from .services import finish_admission,generate_slots
@@ -24,6 +26,47 @@ class SmartMedicalApiTests(APITestCase):
         generate_slots(self.schedule);self.slot=self.schedule.slots.first()
 
     def auth(self,user):self.client.force_authenticate(user)
+
+    def test_patient_calendar_slots_are_scoped_to_selected_schedule(self):
+        second=DoctorSchedule.objects.create(doctor=self.doctor,date=self.schedule.date,start_time=time(14),end_time=time(15),slot_minutes=30)
+        generate_slots(second);self.auth(self.patient_user)
+        response=self.client.get(f'/api/v1/doctors/{self.doctor.pk}/slots/',{'date':str(self.schedule.date),'schedule':second.pk})
+        self.assertEqual(response.status_code,200,response.data)
+        self.assertEqual(len(response.data),2)
+        self.assertTrue(all(slot['schedule_id']==second.pk and slot['start_time']>='14:00:00' for slot in response.data))
+        self.assertEqual(self.client.get(f'/api/v1/doctors/{self.other_doctor.pk}/slots/',{'schedule':second.pk}).data,[])
+        invalid=self.client.get(f'/api/v1/doctors/{self.doctor.pk}/slots/',{'schedule':'invalid'})
+        self.assertEqual(invalid.status_code,400)
+        self.assertIn('schedule',invalid.data['errors'])
+
+    def test_patient_calendar_counts_only_slots_that_have_not_started(self):
+        today=timezone.localdate()
+        schedule=DoctorSchedule.objects.create(doctor=self.doctor,date=today,start_time=time(9),end_time=time(11),slot_minutes=30)
+        generate_slots(schedule);self.auth(self.patient_user)
+        now=timezone.make_aware(datetime.combine(today,time(9,30)))
+        with patch('healthcare.services.timezone.localtime',return_value=now):
+            response=self.client.get(f'/api/v1/doctors/{self.doctor.pk}/slots/',{'date':str(today),'schedule':schedule.pk})
+            self.assertEqual([slot['start_time'] for slot in response.data],['10:00:00','10:30:00'])
+            calendar=self.client.get('/api/v1/schedules/',{'page_size':100})
+            row=next(row for row in calendar.data['results'] if row['id']==schedule.pk)
+            self.assertEqual(row['available_slots'],2)
+            self.assertNotIn('appointments',row)
+        self.auth(self.admin)
+        self.assertEqual(self.client.get(f'/api/v1/schedules/{schedule.pk}/').data['available_slots'],4)
+
+    def test_patient_calendar_hides_closed_past_and_unavailable_doctors(self):
+        closed=DoctorSchedule.objects.create(doctor=self.other_doctor,date=self.schedule.date,start_time=time(14),end_time=time(15),slot_minutes=30,is_active=False)
+        past=DoctorSchedule.objects.create(doctor=self.doctor,date=timezone.localdate()-timedelta(days=1),start_time=time(9),end_time=time(10),slot_minutes=30)
+        self.auth(self.patient_user)
+        response=self.client.get('/api/v1/schedules/')
+        ids={row['id'] for row in response.data['results']}
+        self.assertIn(self.schedule.pk,ids);self.assertNotIn(closed.pk,ids);self.assertNotIn(past.pk,ids)
+        self.doctor.is_available=False;self.doctor.save()
+        self.assertEqual(self.client.get('/api/v1/schedules/').data['count'],0)
+        self.assertEqual(self.client.get(f'/api/v1/doctors/{self.doctor.pk}/slots/').data,[])
+        booking=self.client.post('/api/v1/appointments/',{'slot_id':self.slot.pk,'reason':'不应预约暂停接诊医师'},format='json')
+        self.assertEqual(booking.status_code,400)
+        self.assertEqual(Appointment.objects.count(),0)
 
     def create_appointment(self):
         self.auth(self.patient_user);response=self.client.post('/api/v1/appointments/',{'slot_id':self.slot.pk,'reason':'头痛三天'},format='json')
