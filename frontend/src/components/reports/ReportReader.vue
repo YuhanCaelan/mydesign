@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import{computed,onBeforeUnmount,onMounted}from'vue'
+import{computed,onBeforeUnmount,onMounted,ref,watch}from'vue'
+import QRCode from'qrcode'
 import{ElMessage}from'element-plus'
 import{ArrowLeft,ArrowRight,Close,Download,Printer}from'@element-plus/icons-vue'
 import{downloadMedicalFile}from'../../services/examinations'
+import{createReportShare}from'../../services/clinical'
 import{statusInfo}from'../../utils/status'
 import type{ExaminationOrder}from'../../types/medical'
 
 const props=defineProps<{modelValue:boolean;order:ExaminationOrder|null;index?:number;total?:number}>()
 const emit=defineEmits<{(event:'update:modelValue',value:boolean):void;(event:'prev'):void;(event:'next'):void}>()
 const visible=computed({get:()=>props.modelValue,set:value=>emit('update:modelValue',value)})
+const share=ref<{url:string;qr:string;expires_at:string}|null>(null),shareLoading=ref(false)
+const shareCache=new Map<number,{url:string;qr:string;expires_at:string}>()
 const date=computed(()=>props.order?.published_at||props.order?.completed_at||props.order?.created_at||'')
 const canPrev=computed(()=>Number(props.index||0)>1)
 const canNext=computed(()=>Number(props.index||0)>0&&Number(props.index||0)<Number(props.total||0))
@@ -29,11 +33,25 @@ async function download(id:number,name:string){
   try{await downloadMedicalFile(id,name)}
   catch{ElMessage.error('附件下载失败或无权访问')}
 }
+async function loadShare(){
+  const report=props.order?.report
+  if(!report||report.status!=='published'){share.value=null;return}
+  const cached=shareCache.get(report.id)
+  if(cached){share.value=cached;return}
+  shareLoading.value=true
+  try{
+    const data=await createReportShare(report.id)
+    const qr=await QRCode.toDataURL(data.url,{width:180,margin:1,color:{dark:'#1e3932',light:'#ffffff'}})
+    const entry={url:data.url,qr,expires_at:data.expires_at};shareCache.set(report.id,entry);share.value=entry
+  }catch{share.value=null}
+  finally{shareLoading.value=false}
+}
 function printReport(){
   document.body.classList.add('printing-report')
   window.setTimeout(()=>window.print(),30)
 }
 function cleanupPrint(){document.body.classList.remove('printing-report')}
+watch(()=>[props.modelValue,props.order?.id],()=>{if(props.modelValue)void loadShare()})
 onMounted(()=>window.addEventListener('afterprint',cleanupPrint))
 onBeforeUnmount(()=>{window.removeEventListener('afterprint',cleanupPrint);cleanupPrint()})
 </script>
@@ -100,6 +118,7 @@ onBeforeUnmount(()=>{window.removeEventListener('afterprint',cleanupPrint);clean
           </div>
         </section>
 
+        <section v-if="share" class="report-share"><img :src="share.qr" alt="报告分享二维码"/><div><b>扫码查看电子版</b><p>有效期至 {{dateText(share.expires_at)}}</p><small>二维码只保存安全链接，不包含影像文件本身</small></div></section>
         <footer class="report-paper-foot">
           <span>报告生成时间：{{dateText(date)}}</span>
           <span>高亮仅为阅读提示，不替代临床判断</span>

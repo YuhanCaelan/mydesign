@@ -5,7 +5,7 @@ import{ArrowDown,Clock,Menu as MenuIcon}from'@element-plus/icons-vue'
 import{navigationFor}from'../../config/navigation'
 import{useAuthStore}from'../../stores/auth'
 const auth=useAuthStore(),route=useRoute(),router=useRouter(),mobileOpen=ref(false),compact=ref(false),now=ref(new Date())
-const menu=computed(()=>navigationFor(auth.user!.role)),roleLabel=computed(()=>({admin:'系统管理员',doctor:'医师',patient:'患者'}[auth.user!.role]))
+const menu=computed(()=>navigationFor(auth.user!.role)),roleLabel=computed(()=>({admin:'系统管理员',staff:'科室事务员',doctor:'医师',nurse:'护士',patient:'患者'}[auth.user!.role]))
 const dateText=computed(()=>new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'short'}).format(now.value))
 const timeText=computed(()=>now.value.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false}))
 let timer=0

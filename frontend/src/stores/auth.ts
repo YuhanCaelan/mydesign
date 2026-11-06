@@ -1,8 +1,9 @@
 import {defineStore} from 'pinia'
 import api from '../services/api'
 
-export type UserRole = 'admin' | 'doctor' | 'patient'
-export interface SessionUser {id:number;username:string;full_name:string;role:UserRole;avatar?:string|null}
+export type UserRole = 'admin' | 'staff' | 'doctor' | 'nurse' | 'patient'
+export type StaffStation = 'schedule' | 'admission' | 'cashier' | 'pharmacy' | 'execution'
+export interface SessionUser {id:number;username:string;full_name:string;role:UserRole;avatar?:string|null;department_id?:number|null;department_name?:string|null;station?:StaffStation|'';ward?:string}
 
 function storedUser(): SessionUser | null {
   try { return JSON.parse(localStorage.getItem('smart_medical_user') || 'null') }

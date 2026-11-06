@@ -145,21 +145,24 @@ class SmartMedicalApiTests(APITestCase):
         self.assertEqual(self.client.post(f'/api/v1/examinations/{order_id}/publish/').status_code,200)
         self.auth(self.patient_user);self.assertEqual(self.client.get('/api/v1/examinations/').data['count'],1)
 
-    def test_prescription_payment_dispenses_medicine_deducts_stock_and_records_income(self):
+    def test_prescription_payment_then_pharmacy_dispense_deducts_stock_and_records_income(self):
         record=self.confirmed_record();medicine=Medicine.objects.create(name='阿莫西林胶囊',specification='0.25g×24粒',unit='盒',price='19.50',stock=10)
         self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'遵医嘱服用','items':[{'medicine_id':medicine.pk,'dosage':'0.5g','frequency':'每日两次','duration':'3天','quantity':2}]},format='json')
         self.assertEqual(response.status_code,201,response.data);prescription=Prescription.objects.get(pk=response.data['id']);bill=prescription.billing_record
         self.assertEqual(bill.status,BillingRecord.Status.UNPAID);self.assertEqual(str(bill.amount),'39.00');self.assertEqual(bill.category,BillingRecord.Category.MEDICINE);medicine.refresh_from_db();self.assertEqual(medicine.stock,10)
         self.auth(self.patient_user);response=self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/',{'payment_method':'演示支付'},format='json');self.assertEqual(response.status_code,200,response.data)
-        medicine.refresh_from_db();prescription.refresh_from_db();bill.refresh_from_db();self.assertEqual(medicine.stock,8);self.assertEqual(prescription.status,Prescription.Status.DISPENSED);self.assertIsNotNone(prescription.dispensed_at);self.assertEqual(bill.status,BillingRecord.Status.PAID)
+        medicine.refresh_from_db();prescription.refresh_from_db();bill.refresh_from_db();self.assertEqual(medicine.stock,10);self.assertEqual(prescription.status,Prescription.Status.ISSUED);self.assertIsNone(prescription.dispensed_at);self.assertEqual(bill.status,BillingRecord.Status.PAID)
+        self.auth(self.admin);response=self.client.post(f'/api/v1/prescriptions/{prescription.pk}/dispense/');self.assertEqual(response.status_code,200,response.data)
+        medicine.refresh_from_db();prescription.refresh_from_db();self.assertEqual(medicine.stock,8);self.assertEqual(prescription.status,Prescription.Status.DISPENSED);self.assertEqual(prescription.dispensed_by,self.admin);self.assertIsNotNone(prescription.dispensed_at)
         response=self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/',{'payment_method':'重复支付'},format='json');self.assertEqual(response.status_code,400);medicine.refresh_from_db();self.assertEqual(medicine.stock,8)
         self.auth(self.admin);response=self.client.get('/api/v1/statistics/overview/');self.assertEqual(response.status_code,200);self.assertIn(['累计结算','¥39.00'],response.data['cards'])
 
-    def test_prescription_payment_rolls_back_when_stock_is_insufficient(self):
+    def test_prescription_payment_succeeds_but_dispense_rejects_insufficient_stock(self):
         record=self.confirmed_record();medicine=Medicine.objects.create(name='稀缺药品',specification='1mg',unit='盒',price='12.00',stock=1)
         self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'库存测试','items':[{'medicine_id':medicine.pk,'dosage':'1mg','frequency':'每日一次','duration':'2天','quantity':2}]},format='json');self.assertEqual(response.status_code,201,response.data)
-        prescription=Prescription.objects.get(pk=response.data['id']);bill=prescription.billing_record;self.auth(self.patient_user);response=self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/',format='json');self.assertEqual(response.status_code,400,response.data)
-        medicine.refresh_from_db();prescription.refresh_from_db();bill.refresh_from_db();self.assertEqual(medicine.stock,1);self.assertEqual(prescription.status,Prescription.Status.ISSUED);self.assertEqual(bill.status,BillingRecord.Status.UNPAID)
+        prescription=Prescription.objects.get(pk=response.data['id']);bill=prescription.billing_record;self.auth(self.patient_user);response=self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/',format='json');self.assertEqual(response.status_code,200,response.data)
+        self.auth(self.admin);response=self.client.post(f'/api/v1/prescriptions/{prescription.pk}/dispense/');self.assertEqual(response.status_code,400,response.data)
+        medicine.refresh_from_db();prescription.refresh_from_db();bill.refresh_from_db();self.assertEqual(medicine.stock,1);self.assertEqual(prescription.status,Prescription.Status.ISSUED);self.assertEqual(bill.status,BillingRecord.Status.PAID)
 
     def test_examination_item_creates_unique_bill_and_cancel_syncs_it(self):
         record=self.confirmed_record();item=ExaminationItem.objects.create(name='CT 平扫',category='imaging',price='360.00')
@@ -178,8 +181,9 @@ class SmartMedicalApiTests(APITestCase):
 
     def test_dispensing_creates_stock_movement(self):
         record=self.confirmed_record();medicine=Medicine.objects.create(name='流水测试药',specification='1mg',price='10',stock=3)
-        self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'','items':[{'medicine_id':medicine.pk,'dosage':'1mg','frequency':'每日一次','duration':'1天','quantity':1}]},format='json');bill=Prescription.objects.get(pk=response.data['id']).billing_record
+        self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'','items':[{'medicine_id':medicine.pk,'dosage':'1mg','frequency':'每日一次','duration':'1天','quantity':1}]},format='json');prescription=Prescription.objects.get(pk=response.data['id']);bill=prescription.billing_record
         self.auth(self.patient_user);self.assertEqual(self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/').status_code,200)
+        self.auth(self.admin);self.assertEqual(self.client.post(f'/api/v1/prescriptions/{prescription.pk}/dispense/').status_code,200)
         movement=MedicineStockMovement.objects.get(medicine=medicine);self.assertEqual(movement.quantity,-1);self.assertEqual(movement.balance_after,2)
 
     def test_doctor_workspace_is_scoped_and_password_can_change(self):
@@ -847,6 +851,58 @@ class SmartMedicalApiTests(APITestCase):
         self.auth(self.patient_user)
         response=self.client.get('/api/v1/examinations/',{'patient':self.patient.pk,'report_status':'published'})
         self.assertEqual(response.data['count'],1,response.data);self.assertEqual(response.data['results'][0]['report']['conclusion'],'颅脑 MRI 未见明显异常')
+
+    def test_emergency_walk_in_has_no_slot_and_enters_doctor_queue(self):
+        nurse=User.objects.create_user('nurse_p0',password='NursePass123!',first_name='周护士',role=User.Role.NURSE,department=self.department)
+        self.auth(nurse)
+        response=self.client.post('/api/v1/appointments/emergency/',{'patient_id':self.patient.pk,'doctor_id':self.doctor.pk,'triage_level':2,'reason':'突发胸痛'},format='json')
+        self.assertEqual(response.status_code,201,response.data)
+        self.assertEqual(response.data['visit_type'],Appointment.VisitType.EMERGENCY);self.assertIsNone(response.data['slot']);self.assertEqual(response.data['triage_level'],2)
+        self.auth(self.doctor_user);queue=self.client.get('/api/v1/appointments/',{'visit_type':'emergency','status':'pending'})
+        self.assertEqual(queue.status_code,200,queue.data);self.assertEqual(queue.data['count'],1,queue.data)
+        self.auth(self.patient_user);response=self.client.post('/api/v1/appointments/emergency/',{'patient_id':self.patient.pk,'doctor_id':self.doctor.pk,'triage_level':2,'reason':'患者自助'},format='json')
+        self.assertEqual(response.status_code,403,response.data)
+
+    def test_pharmacy_dispense_and_refund_before_dispense(self):
+        pharmacy=User.objects.create_user('pharmacy_p0',password='StaffPass123!',first_name='钱药师',role=User.Role.STAFF,station=User.Station.PHARMACY,department=self.department)
+        cashier=User.objects.create_user('cashier_p0',password='StaffPass123!',first_name='赵收费',role=User.Role.STAFF,station=User.Station.CASHIER,department=self.department)
+        record=self.confirmed_record();medicine=Medicine.objects.create(name='P0药品',specification='1mg',unit='盒',price='10.00',stock=5)
+        self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'','items':[{'medicine_id':medicine.pk,'dosage':'1mg','frequency':'每日一次','duration':'1天','quantity':2}]},format='json')
+        self.assertEqual(response.status_code,201,response.data);rx=Prescription.objects.get(pk=response.data['id']);bill=rx.billing_record
+        self.auth(self.patient_user);self.assertEqual(self.client.post(f'/api/v1/billing-records/{bill.pk}/pay/').status_code,200)
+        medicine.refresh_from_db();rx.refresh_from_db();self.assertEqual(medicine.stock,5);self.assertEqual(rx.status,Prescription.Status.ISSUED)
+        self.auth(pharmacy);dispense=self.client.post(f'/api/v1/prescriptions/{rx.pk}/dispense/');self.assertEqual(dispense.status_code,200,dispense.data)
+        medicine.refresh_from_db();rx.refresh_from_db();self.assertEqual(medicine.stock,3);self.assertEqual(rx.status,Prescription.Status.DISPENSED)
+        self.auth(cashier);refund=self.client.post(f'/api/v1/billing-records/{bill.pk}/refund/',{'reason':'已发药退费'},format='json');self.assertEqual(refund.status_code,400,refund.data)
+        second=Medicine.objects.create(name='P0退费药',specification='1mg',unit='盒',price='8.00',stock=5)
+        self.auth(self.doctor_user);response=self.client.post('/api/v1/prescriptions/',{'record_id':record.pk,'notes':'','items':[{'medicine_id':second.pk,'dosage':'1mg','frequency':'每日一次','duration':'1天','quantity':1}]},format='json');rx2=Prescription.objects.get(pk=response.data['id']);bill2=rx2.billing_record
+        self.auth(self.patient_user);self.assertEqual(self.client.post(f'/api/v1/billing-records/{bill2.pk}/pay/').status_code,200)
+        self.auth(cashier);refund=self.client.post(f'/api/v1/billing-records/{bill2.pk}/refund/',{'reason':'未发药退费'},format='json')
+        self.assertEqual(refund.status_code,200,refund.data);bill2.refresh_from_db();rx2.refresh_from_db();self.assertEqual(bill2.status,BillingRecord.Status.REFUNDED);self.assertEqual(rx2.status,Prescription.Status.CANCELLED)
+
+    def test_inpatient_admission_office_nurse_receive_record_and_orders(self):
+        admission_staff=User.objects.create_user('admission_p0',password='StaffPass123!',first_name='李住院',role=User.Role.STAFF,station=User.Station.ADMISSION,department=self.department)
+        nurse=User.objects.create_user('nurse_ward_p0',password='NursePass123!',first_name='周护士',role=User.Role.NURSE,department=self.department)
+        bed=WardBed.objects.create(department=self.department,ward_name='P0 病区',bed_no='01',daily_rate='100.00')
+        self.auth(self.doctor_user);response=self.client.post('/api/v1/inpatients/',{'patient_id':self.patient.pk,'doctor_id':self.doctor.pk,'department_id':self.department.pk,'admission_diagnosis':'P0 住院验证'},format='json')
+        self.assertEqual(response.status_code,201,response.data);admission_id=response.data['id']
+        self.auth(admission_staff);assigned=self.client.post(f'/api/v1/inpatients/{admission_id}/assign-bed/',{'bed_id':bed.pk},format='json');self.assertEqual(assigned.status_code,200,assigned.data)
+        admitted=self.client.post(f'/api/v1/inpatients/{admission_id}/admit/');self.assertEqual(admitted.status_code,200,admitted.data)
+        self.auth(nurse);received=self.client.post(f'/api/v1/inpatients/{admission_id}/receive/');self.assertEqual(received.status_code,200,received.data);self.assertIsNotNone(received.data['received_at'])
+        self.auth(self.doctor_user);record=self.client.put(f'/api/v1/inpatients/{admission_id}/record/',{'chief_complaint':'胸痛','diagnosis':'冠心病'},format='json');self.assertEqual(record.status_code,200,record.data);self.assertEqual(record.data['record']['diagnosis'],'冠心病')
+        order=self.client.post(f'/api/v1/inpatients/{admission_id}/orders/',{'order_type':'long','category':'nursing','content':'低盐低脂饮食','frequency':'每日'},format='json');self.assertEqual(order.status_code,201,order.data)
+        self.auth(nurse);executed=self.client.post(f'/api/v1/inpatients/{admission_id}/orders/{order.data["id"]}/execute/',{'execution_note':'已执行'},format='json');self.assertEqual(executed.status_code,200,executed.data);self.assertEqual(executed.data['status'],InpatientOrder.Status.COMPLETED)
+        self.auth(admission_staff);self.assertEqual(self.client.post(f'/api/v1/inpatients/{admission_id}/discharge/',{'discharge_summary':'好转出院'},format='json').status_code,200)
+
+    def test_published_report_share_token_is_time_limited_and_public(self):
+        record=self.confirmed_record();order=ExaminationOrder.objects.create(patient=self.patient,doctor=self.doctor,record=record,item_name_snapshot='P0 报告',type='ct',status=ExaminationOrder.Status.PUBLISHED,clinical_question='验证分享')
+        report=ExaminationReport.objects.create(order=order,findings='未见异常',conclusion='分享结论',status=ExaminationReport.Status.PUBLISHED,published_by=self.admin,published_at=timezone.now())
+        self.auth(self.doctor_user);response=self.client.post(f'/api/v1/examination-reports/{report.pk}/share/')
+        self.assertEqual(response.status_code,201,response.data);token=response.data['token']
+        self.client.force_authenticate(None);public=self.client.get(f'/api/v1/share/reports/{token}/')
+        self.assertEqual(public.status_code,200,public.data);self.assertEqual(public.data['report']['conclusion'],'分享结论')
+        share=ReportShareToken.objects.get(token=token);share.expires_at=timezone.now()-timedelta(seconds=1);share.save(update_fields=['expires_at'])
+        self.assertEqual(self.client.get(f'/api/v1/share/reports/{token}/').status_code,403)
 
 class DemoFlowCommandTests(APITestCase):
     """演示验收脚本默认事务回滚：运行前后演示数据完全一致。"""

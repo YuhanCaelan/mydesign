@@ -39,6 +39,7 @@ manage.py             当前系统的 Django 管理入口
 python -m pip install -r requirements.txt
 python manage.py migrate
 python manage.py seed_smartmedical
+python manage.py seed_p0_upgrade
 cd frontend
 npm ci
 npm run build
@@ -55,8 +56,21 @@ python manage.py runserver 127.0.0.1:8000
 | 管理员 | `admin` | `Admin123!` |
 | 医师 | `doctor` | `Doctor123!` |
 | 患者 | `patient` | `Patient123!` |
+| 科室事务员（排班/住院处/收费/药房/医技） | `schedule_staff` / `admission_staff` / `cashier` / `pharmacy` / `tech` | `Staff123!` |
+| 护士 | `nurse` | `Nurse123!` |
 
 开发前端时可在 `frontend/` 执行 `npm run dev`；Vite 将 `/api` 请求代理到本地 Django 服务。
+
+## P0/P1 升级要点
+
+- **医生工作区承载开单**：接诊工作区新增「医嘱」页签，可在同一页开具处方（显示库存）、检查、处置和住院申请，自动关联当前病历。
+- **角色分工**：管理员只保留系统账号、基础字典与审计；排班、住院处、收费退费、药房、医技执行为科室事务员岗位；护士负责急诊登记、住院接诊和医嘱执行。
+- **急诊**：不支持预约，由护士现场登记分诊，进入医生接诊队列。
+- **费用与执行**：缴费与发药/执行分离；药房确认发药、医技确认执行；收费岗可对已缴费且未执行的账单全额退费。
+- **住院**：医生申请 → 住院处分床/入院 → 护士接诊 → 住院病志 + 长期/临时医嘱 → 护士执行 → 出院结算。
+- **疾病模板与报告二维码**：门诊可套用疾病模板只填左右/轻重/病程；报告阅读器生成 7 天有效的扫码链接。
+
+完整落地范围、演示账号与刻意简化见 [docs/P0_P1_IMPLEMENTATION.md](docs/P0_P1_IMPLEMENTATION.md)。
 
 ## 验证
 
@@ -64,4 +78,7 @@ python manage.py runserver 127.0.0.1:8000
 python manage.py check
 python manage.py test healthcare
 cd frontend && npm run build
+cd ..
+python verify_navigation_ui.py
+python verify_p0p1_ui.py
 ```

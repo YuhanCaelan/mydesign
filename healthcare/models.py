@@ -9,10 +9,15 @@ from django.utils import timezone
 
 class User(AbstractUser):
     class Role(models.TextChoices):
-        ADMIN='admin','管理员';DOCTOR='doctor','医师';PATIENT='patient','患者'
+        ADMIN='admin','管理员';STAFF='staff','科室事务员';DOCTOR='doctor','医师';NURSE='nurse','护士';PATIENT='patient','患者'
+    class Station(models.TextChoices):
+        SCHEDULE='schedule','排班岗';ADMISSION='admission','住院处';CASHIER='cashier','收费退费';PHARMACY='pharmacy','药房';EXECUTION='execution','医技执行'
     role=models.CharField('角色',max_length=12,choices=Role.choices)
     phone=models.CharField('手机号码',max_length=20,blank=True)
     avatar=models.ImageField('头像',upload_to='avatars/%Y/%m/',blank=True)
+    department=models.ForeignKey('Department',on_delete=models.SET_NULL,null=True,blank=True,related_name='staff_users',verbose_name='所属科室')
+    station=models.CharField('事务员岗位',max_length=16,choices=Station.choices,blank=True)
+    ward=models.CharField('病区',max_length=80,blank=True)
     created_at=models.DateTimeField(auto_now_add=True)
     updated_at=models.DateTimeField(auto_now=True)
     def save(self,*args,**kwargs):
@@ -95,21 +100,43 @@ class AppointmentSlot(TimeStampedModel):
 
 class Appointment(TimeStampedModel):
     class Status(models.TextChoices):PENDING='pending','待就诊';IN_PROGRESS='in_progress','就诊中';COMPLETED='completed','已完成';CANCELLED='cancelled','已取消';NO_SHOW='no_show','爽约'
+    class VisitType(models.TextChoices):OUTPATIENT='outpatient','门诊';EMERGENCY='emergency','急诊'
+    class Source(models.TextChoices):ONLINE='online','线上预约';WINDOW='window','窗口挂号';EMERGENCY='emergency','急诊登记'
     appointment_no=models.CharField(max_length=24,unique=True,blank=True)
     patient=models.ForeignKey(PatientProfile,on_delete=models.PROTECT,related_name='appointments')
     doctor=models.ForeignKey(DoctorProfile,on_delete=models.PROTECT,related_name='appointments')
     department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='appointments',verbose_name='预约科室快照')
-    slot=models.ForeignKey(AppointmentSlot,on_delete=models.PROTECT,related_name='appointments')
+    slot=models.ForeignKey(AppointmentSlot,on_delete=models.PROTECT,null=True,blank=True,related_name='appointments')
+    visit_type=models.CharField('就诊类型',max_length=16,choices=VisitType.choices,null=True,blank=True,db_index=True)
+    source=models.CharField('来源',max_length=16,choices=Source.choices,null=True,blank=True)
+    triage_level=models.PositiveSmallIntegerField('分诊级别',null=True,blank=True,help_text='1 濒危 / 2 危重 / 3 急症 / 4 非急症')
+    arrived_at=models.DateTimeField('到达时间',null=True,blank=True)
     status=models.CharField(max_length=16,choices=Status.choices,default=Status.PENDING,db_index=True)
     reason=models.TextField();cancelled_at=models.DateTimeField(null=True,blank=True);completed_at=models.DateTimeField(null=True,blank=True)
     class Meta:
-        ordering=['-slot__schedule__date','-slot__start_time']
+        ordering=['-created_at']
         indexes=[models.Index(fields=['patient','status'],name='idx_appointment_patient_status'),models.Index(fields=['doctor','status'],name='idx_appointment_doctor_status'),models.Index(fields=['department','status'],name='idx_appointment_dept_status'),models.Index(fields=['status','created_at'],name='idx_appointment_status_created')]
         constraints=[models.UniqueConstraint(fields=['slot'],condition=models.Q(status__in=['pending','in_progress','completed']),name='uq_active_appointment_slot')]
     def save(self,*args,**kwargs):
         if self.department_id is None and self.doctor_id:self.department_id=self.doctor.department_id
+        if not self.visit_type:self.visit_type=self.VisitType.OUTPATIENT
+        if not self.source:self.source=self.Source.ONLINE
+        if self.visit_type==self.VisitType.EMERGENCY:
+            self.slot=None
+            if self.source!=self.Source.EMERGENCY:self.source=self.Source.EMERGENCY
         fresh=self.pk is None;super().save(*args,**kwargs)
         if fresh and not self.appointment_no:self.appointment_no=f'A{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(appointment_no=self.appointment_no)
+    @property
+    def visit_date(self):
+        if self.slot_id:return self.slot.schedule.date
+        if self.arrived_at:return timezone.localtime(self.arrived_at).date()
+        return timezone.localtime(self.created_at).date()
+    @property
+    def visit_time(self):
+        if self.slot_id:return self.slot.start_time
+        return timezone.localtime(self.arrived_at or self.created_at).time()
+    @property
+    def is_emergency(self):return self.visit_type==self.VisitType.EMERGENCY
 
 
 class MedicalRecord(TimeStampedModel):
@@ -164,6 +191,8 @@ class Prescription(TimeStampedModel):
     record=models.ForeignKey(MedicalRecord,on_delete=models.PROTECT,related_name='prescriptions')
     doctor=models.ForeignKey(DoctorProfile,on_delete=models.PROTECT,related_name='prescriptions')
     status=models.CharField(max_length=12,choices=Status.choices,default=Status.ISSUED,db_index=True);notes=models.TextField(blank=True);dispensed_at=models.DateTimeField(null=True,blank=True)
+    dispensed_by=models.ForeignKey(User,on_delete=models.PROTECT,null=True,blank=True,related_name='dispensed_prescriptions')
+    execution_department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='dispensed_prescriptions')
     class Meta:ordering=['-created_at']
     def save(self,*args,**kwargs):
         fresh=self.pk is None;super().save(*args,**kwargs)
@@ -201,6 +230,9 @@ class ExaminationOrder(TimeStampedModel):
     price_snapshot=models.DecimalField(max_digits=10,decimal_places=2,default=0)
     type=models.CharField(max_length=12,choices=Type.choices);status=models.CharField(max_length=16,choices=Status.choices,default=Status.REQUESTED,db_index=True)
     clinical_question=models.TextField();completed_at=models.DateTimeField(null=True,blank=True)
+    started_by=models.ForeignKey(User,on_delete=models.PROTECT,null=True,blank=True,related_name='started_examinations')
+    started_at=models.DateTimeField(null=True,blank=True)
+    execution_department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='executed_examinations')
     class Meta:
         ordering=['-created_at']
         indexes=[models.Index(fields=['patient','status'],name='idx_examorder_patient_status'),models.Index(fields=['created_at'],name='idx_examorder_created')]
@@ -216,6 +248,55 @@ class ExaminationReport(TimeStampedModel):
     published_by=models.ForeignKey(User,on_delete=models.PROTECT,null=True,blank=True,related_name='published_reports');published_at=models.DateTimeField(null=True,blank=True)
 
 
+class ProcedureItem(TimeStampedModel):
+    class Category(models.TextChoices):
+        TREATMENT='treatment','治疗';NURSING='nursing','护理';MINOR_SURGERY='minor_surgery','小手术';DAY_SURGERY='day_surgery','日间手术';OTHER='other','其他'
+    name=models.CharField(max_length=120,unique=True)
+    category=models.CharField(max_length=20,choices=Category.choices,default=Category.TREATMENT)
+    price=models.DecimalField(max_digits=10,decimal_places=2,validators=[MinValueValidator(0)])
+    execution_department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='procedure_items')
+    is_active=models.BooleanField(default=True,db_index=True)
+    description=models.CharField(max_length=300,blank=True)
+    class Meta:ordering=['category','name']
+    def __str__(self):return self.name
+
+
+class ProcedureOrder(TimeStampedModel):
+    class Status(models.TextChoices):REQUESTED='requested','已申请';IN_PROGRESS='in_progress','处置中';COMPLETED='completed','已完成';CANCELLED='cancelled','已取消'
+    order_no=models.CharField(max_length=24,unique=True,blank=True)
+    patient=models.ForeignKey(PatientProfile,on_delete=models.PROTECT,related_name='procedure_orders')
+    doctor=models.ForeignKey(DoctorProfile,on_delete=models.PROTECT,related_name='procedure_orders')
+    record=models.ForeignKey(MedicalRecord,on_delete=models.PROTECT,related_name='procedure_orders')
+    item=models.ForeignKey(ProcedureItem,on_delete=models.PROTECT,null=True,blank=True,related_name='orders')
+    item_name_snapshot=models.CharField(max_length=120,blank=True)
+    price_snapshot=models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    category=models.CharField(max_length=20,choices=ProcedureItem.Category.choices,default=ProcedureItem.Category.TREATMENT)
+    clinical_note=models.TextField(blank=True)
+    status=models.CharField(max_length=16,choices=Status.choices,default=Status.REQUESTED,db_index=True)
+    executed_by=models.ForeignKey(User,on_delete=models.PROTECT,null=True,blank=True,related_name='executed_procedures')
+    executed_at=models.DateTimeField(null=True,blank=True)
+    execution_note=models.CharField(max_length=300,blank=True)
+    execution_department=models.ForeignKey(Department,on_delete=models.PROTECT,null=True,blank=True,related_name='procedure_orders')
+    class Meta:
+        ordering=['-created_at']
+        indexes=[models.Index(fields=['patient','status'],name='idx_procedure_patient_status')]
+    def save(self,*args,**kwargs):
+        fresh=self.pk is None;super().save(*args,**kwargs)
+        if fresh and not self.order_no:self.order_no=f'PR{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(order_no=self.order_no)
+
+
+class ReportShareToken(TimeStampedModel):
+    report=models.ForeignKey(ExaminationReport,on_delete=models.CASCADE,related_name='share_tokens')
+    token=models.CharField(max_length=64,unique=True)
+    expires_at=models.DateTimeField()
+    created_by=models.ForeignKey(User,on_delete=models.PROTECT,null=True,blank=True,related_name='report_share_tokens')
+    access_count=models.PositiveIntegerField(default=0)
+    revoked=models.BooleanField(default=False)
+    class Meta:ordering=['-created_at']
+    @property
+    def is_valid(self):return not self.revoked and timezone.now()<self.expires_at
+
+
 def medical_file_path(instance,filename):return f'examinations/{instance.order_id}/{timezone.localdate():%Y/%m}/{Path(filename).name}'
 class MedicalFile(models.Model):
     order=models.ForeignKey(ExaminationOrder,on_delete=models.CASCADE,related_name='files')
@@ -225,11 +306,12 @@ class MedicalFile(models.Model):
 
 
 class BillingRecord(TimeStampedModel):
-    class Status(models.TextChoices):UNPAID='unpaid','待缴费';PAID='paid','已缴费';CANCELLED='cancelled','已取消'
-    class Category(models.TextChoices):REGISTRATION='registration','挂号费';EXAMINATION='examination','检查费';MEDICINE='medicine','药品费';INPATIENT='inpatient','住院费';OTHER='other','其他'
+    class Status(models.TextChoices):UNPAID='unpaid','待缴费';PAID='paid','已缴费';CANCELLED='cancelled','已取消';REFUNDED='refunded','已退费'
+    class Category(models.TextChoices):REGISTRATION='registration','挂号费';EXAMINATION='examination','检查费';PROCEDURE='procedure','处置费';MEDICINE='medicine','药品费';INPATIENT='inpatient','住院费';OTHER='other','其他'
     bill_no=models.CharField(max_length=24,unique=True,blank=True)
     patient=models.ForeignKey(PatientProfile,on_delete=models.PROTECT,related_name='billing_records');appointment=models.ForeignKey(Appointment,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_records');prescription=models.OneToOneField(Prescription,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
     examination=models.OneToOneField(ExaminationOrder,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
+    procedure=models.OneToOneField(ProcedureOrder,on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
     admission=models.OneToOneField('InpatientAdmission',on_delete=models.PROTECT,null=True,blank=True,related_name='billing_record')
     inpatient_admission=models.ForeignKey('InpatientAdmission',on_delete=models.PROTECT,null=True,blank=True,related_name='charges',verbose_name='所属住院')
     category=models.CharField(max_length=20,choices=Category.choices,default=Category.OTHER);description=models.CharField(max_length=200);amount=models.DecimalField(max_digits=10,decimal_places=2);status=models.CharField(max_length=12,choices=Status.choices,default=Status.UNPAID)
@@ -242,6 +324,21 @@ class BillingRecord(TimeStampedModel):
         if fresh and not self.bill_no:self.bill_no=f'BL{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(bill_no=self.bill_no)
     @property
     def days_admitted(self):return self.admission.days_admitted if self.admission_id else None
+
+
+class RefundRecord(TimeStampedModel):
+    class Status(models.TextChoices):DONE='done','已退费'
+    refund_no=models.CharField(max_length=24,unique=True,blank=True)
+    bill=models.OneToOneField(BillingRecord,on_delete=models.PROTECT,related_name='refund')
+    amount=models.DecimalField(max_digits=10,decimal_places=2)
+    reason=models.CharField(max_length=200)
+    operator=models.ForeignKey(User,on_delete=models.PROTECT,related_name='refunds')
+    status=models.CharField(max_length=12,choices=Status.choices,default=Status.DONE)
+    refunded_at=models.DateTimeField(default=timezone.now)
+    class Meta:ordering=['-created_at']
+    def save(self,*args,**kwargs):
+        fresh=self.pk is None;super().save(*args,**kwargs)
+        if fresh and not self.refund_no:self.refund_no=f'RF{timezone.localdate():%Y%m%d}{self.pk:06d}';type(self).objects.filter(pk=self.pk).update(refund_no=self.refund_no)
 
 
 class WardBed(TimeStampedModel):
@@ -269,6 +366,9 @@ class InpatientAdmission(TimeStampedModel):
     admission_diagnosis=models.TextField();discharge_summary=models.TextField(blank=True)
     status=models.CharField(max_length=12,choices=Status.choices,default=Status.PENDING,db_index=True)
     admitted_at=models.DateTimeField(null=True,blank=True);discharged_at=models.DateTimeField(null=True,blank=True)
+    received_at=models.DateTimeField('护士接诊时间',null=True,blank=True)
+    receiving_nurse=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='received_admissions')
+    admission_staff=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='admitted_admissions')
     class Meta:ordering=['-created_at']
     def save(self,*args,**kwargs):
         fresh=self.pk is None;super().save(*args,**kwargs)
@@ -287,6 +387,56 @@ class InpatientAdmission(TimeStampedModel):
     def projected_bed_fee(self):
         if self.status!=self.Status.ADMITTED:return Decimal('0')
         return self.daily_rate_snapshot*self.days_admitted
+
+
+class InpatientRecord(TimeStampedModel):
+    """住院病志：一次住院一份，和门诊病历严格分开。"""
+    admission=models.OneToOneField(InpatientAdmission,on_delete=models.CASCADE,related_name='inpatient_record')
+    chief_complaint=models.TextField(blank=True)
+    present_illness=models.TextField(blank=True)
+    past_history=models.TextField(blank=True)
+    physical_exam=models.TextField(blank=True)
+    diagnosis=models.TextField(blank=True)
+    course=models.TextField(blank=True,help_text='病程记录')
+    discharge_summary=models.TextField(blank=True)
+    created_by=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='created_inpatient_records')
+    updated_by=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='updated_inpatient_records')
+
+
+class InpatientOrder(TimeStampedModel):
+    """住院医嘱：长期医嘱与临时医嘱分开存放，护士执行后回写执行人。"""
+    class OrderType(models.TextChoices):LONG='long','长期医嘱';TEMP='temp','临时医嘱'
+    class Category(models.TextChoices):MEDICATION='medication','药品';NURSING='nursing','护理';EXAM='exam','检查';PROCEDURE='procedure','处置';OTHER='other','其他'
+    class Status(models.TextChoices):DRAFT='draft','草稿';SUBMITTED='submitted','已提交';EXECUTING='executing','执行中';COMPLETED='completed','已完成';STOPPED='stopped','已停止';CANCELLED='cancelled','已取消'
+    admission=models.ForeignKey(InpatientAdmission,on_delete=models.CASCADE,related_name='orders')
+    order_type=models.CharField(max_length=8,choices=OrderType.choices,default=OrderType.TEMP,db_index=True)
+    category=models.CharField(max_length=16,choices=Category.choices,default=Category.OTHER)
+    content=models.TextField()
+    dosage=models.CharField(max_length=80,blank=True);frequency=models.CharField(max_length=80,blank=True)
+    start_at=models.DateTimeField(null=True,blank=True);stop_at=models.DateTimeField(null=True,blank=True)
+    status=models.CharField(max_length=16,choices=Status.choices,default=Status.SUBMITTED,db_index=True)
+    prescriber=models.ForeignKey(User,on_delete=models.PROTECT,related_name='created_inpatient_orders')
+    executor=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='executed_inpatient_orders')
+    executed_at=models.DateTimeField(null=True,blank=True);execution_note=models.CharField(max_length=300,blank=True)
+    class Meta:
+        ordering=['order_type','-created_at']
+        indexes=[models.Index(fields=['admission','order_type','status'],name='idx_inpatient_order_queue')]
+
+
+class RecordTemplate(TimeStampedModel):
+    """门诊病历模板：变量占位由前端替换，医生可继续编辑。"""
+    department=models.ForeignKey(Department,on_delete=models.SET_NULL,null=True,blank=True,related_name='record_templates')
+    name=models.CharField(max_length=100)
+    diagnosis=models.CharField(max_length=200,blank=True)
+    chief_complaint=models.TextField(blank=True)
+    present_illness=models.TextField(blank=True)
+    past_history=models.TextField(blank=True)
+    examination=models.TextField(blank=True)
+    treatment=models.TextField(blank=True)
+    variables=models.JSONField(default=dict,blank=True,help_text='如 {"side":["左侧","右侧","双侧"],"severity":["轻度","中度","重度"]}')
+    is_active=models.BooleanField(default=True,db_index=True)
+    created_by=models.ForeignKey(User,on_delete=models.SET_NULL,null=True,blank=True,related_name='record_templates')
+    class Meta:ordering=['department__name','name']
 
 
 class AIService(TimeStampedModel):

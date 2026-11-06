@@ -27,12 +27,16 @@ const role=computed(()=>auth.user!.role),isAdmin=computed(()=>role.value==='admi
 const copy=computed(()=>({
   admin:{title:'医院运行全景',desc:'聚合诊疗、检查、住院、药房与费用链路，快速定位运营阻塞点。'},
   doctor:{title:`${auth.user?.full_name}，今日诊疗有序推进`,desc:'在一个视图中掌握接诊节奏、检查协作队列与患者进展。'},
-  patient:{title:`您好，${auth.user?.full_name}`,desc:'这里汇总您的预约、检查报告、处方和待支付事项。'}
+  patient:{title:`您好，${auth.user?.full_name}`,desc:'这里汇总您的预约、检查报告、处方和待支付事项。'},
+  staff:{title:'科室事务工作台',desc:'排班、住院处、收费退费、药房与医技执行按岗位进入。'},
+  nurse:{title:'护理工作台',desc:'急诊登记、住院接诊与医嘱执行。'}
 }[role.value]))
 const quick=computed(()=>({
   admin:[['人员与科室','/console/people?tab=doctors'],['排班设置','/console/outpatient?tab=schedules'],['检查管理','/console/clinical?tab=examinations'],['费用结算','/console/operations?tab=bills']],
   doctor:[['开始接诊','/doctor/outpatient?tab=appointments'],['诊疗档案','/doctor/records'],['书写病历','/doctor/clinical?tab=records'],['检查协作','/doctor/clinical?tab=examinations'],['住院管理','/doctor/inpatient?tab=admissions']],
-  patient:[['预约挂号','/patient/visits?tab=appointments'],['历史病历','/patient/records?tab=records'],['检查报告','/patient/records?tab=reports'],['查看账单','/patient/finance?tab=bills'],['我的处方','/patient/care?tab=prescriptions']]
+  patient:[['预约挂号','/patient/visits?tab=appointments'],['历史病历','/patient/records?tab=records'],['检查报告','/patient/records?tab=reports'],['查看账单','/patient/finance?tab=bills'],['我的处方','/patient/care?tab=prescriptions']],
+  staff:[['岗位工作台','/staff']],
+  nurse:[['护理工作台','/nurse']]
 }[role.value]))
 function openActivity(item:RecentActivity){
   if(role.value==='doctor')router.push({path:`/doctor/visits/${item.id}`,query:{returnTo:'/dashboard'}})

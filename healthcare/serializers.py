@@ -1,7 +1,7 @@
 from decimal import Decimal,InvalidOperation
 from django.contrib.auth import authenticate,password_validation
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Count,Sum
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -9,8 +9,8 @@ from .models import *
 from .services import book_appointment,bookable_slots,generate_slots,link_inpatient
 
 class SessionUserSerializer(serializers.ModelSerializer):
-    full_name=serializers.SerializerMethodField();avatar=serializers.SerializerMethodField()
-    class Meta:model=User;fields=('id','username','full_name','role','phone','email','avatar')
+    full_name=serializers.SerializerMethodField();avatar=serializers.SerializerMethodField();department_name=serializers.CharField(source='department.name',read_only=True)
+    class Meta:model=User;fields=('id','username','full_name','role','phone','email','avatar','department_id','department_name','station','ward')
     def get_full_name(self,obj):return obj.get_full_name() or obj.username
     def get_avatar(self,obj):return self.context['request'].build_absolute_uri(obj.avatar.url) if obj.avatar and self.context.get('request') else None
 
@@ -61,13 +61,15 @@ class PatientSerializer(serializers.ModelSerializer):
 class AdminUserSerializer(serializers.ModelSerializer):
     full_name=serializers.CharField(source='first_name');password=serializers.CharField(write_only=True,min_length=8,required=False)
     department_id=serializers.PrimaryKeyRelatedField(source='department',queryset=Department.objects.filter(status=Department.Status.ACTIVE),write_only=True,required=False)
+    station=serializers.ChoiceField(choices=User.Station.choices,required=False,allow_blank=True)
+    ward=serializers.CharField(required=False,allow_blank=True)
     title=serializers.CharField(write_only=True,required=False,allow_blank=True);specialty=serializers.CharField(write_only=True,required=False,allow_blank=True)
     gender=serializers.ChoiceField(source='patient_gender',choices=PatientProfile.Gender.choices,write_only=True,required=False)
     birth_date=serializers.DateField(source='patient_birth_date',write_only=True,required=False,allow_null=True)
     address=serializers.CharField(source='patient_address',write_only=True,required=False,allow_blank=True)
     role_display=serializers.CharField(source='get_role_display',read_only=True);is_active_display=serializers.SerializerMethodField();doctor_no=serializers.SerializerMethodField();department_name=serializers.SerializerMethodField()
     patient_no=serializers.SerializerMethodField();doctor_id=serializers.SerializerMethodField();patient_id=serializers.SerializerMethodField();doctor_title=serializers.SerializerMethodField();doctor_specialty=serializers.SerializerMethodField()
-    class Meta:model=User;fields=('id','username','full_name','password','role','role_display','phone','email','is_active','is_active_display','department_id','department_name','doctor_no','doctor_id','doctor_title','doctor_specialty','patient_no','patient_id','gender','birth_date','address','title','specialty','created_at');read_only_fields=('created_at',)
+    class Meta:model=User;fields=('id','username','full_name','password','role','role_display','phone','email','is_active','is_active_display','department_id','department_name','station','ward','doctor_no','doctor_id','doctor_title','doctor_specialty','patient_no','patient_id','gender','birth_date','address','title','specialty','created_at');read_only_fields=('created_at',)
     def get_is_active_display(self,obj):return '启用' if obj.is_active else '禁用'
     def _doctor(self,obj):
         try:return obj.doctor_profile
@@ -88,12 +90,16 @@ class AdminUserSerializer(serializers.ModelSerializer):
     def get_patient_id(self,obj):
         patient=self._patient(obj);return patient.pk if patient else None
     def get_department_name(self,obj):
-        doctor=self._doctor(obj);return doctor.department.name if doctor else None
+        doctor=self._doctor(obj)
+        if doctor:return doctor.department.name
+        return obj.department.name if obj.department_id else None
     def validate_password(self,value):
         password_validation.validate_password(value);return value
     def validate(self,attrs):
         if self.instance is None and not attrs.get('password'):raise serializers.ValidationError({'password':'创建账户必须设置初始密码。'})
         if self.instance is None and attrs.get('role')==User.Role.DOCTOR and not attrs.get('department'):raise serializers.ValidationError({'department_id':'创建医师必须选择科室。'})
+        if self.instance is None and attrs.get('role')==User.Role.STAFF and (not attrs.get('department') or not attrs.get('station')):raise serializers.ValidationError({'station':'创建科室事务员必须选择科室与岗位。'})
+        if self.instance is None and attrs.get('role')==User.Role.NURSE and not attrs.get('department'):raise serializers.ValidationError({'department_id':'创建护士必须选择科室。'})
         if self.instance is None and attrs.get('role')==User.Role.ADMIN:raise serializers.ValidationError({'role':'不能通过接口创建管理员。'})
         return attrs
     @transaction.atomic
@@ -104,12 +110,15 @@ class AdminUserSerializer(serializers.ModelSerializer):
         if user.role==User.Role.DOCTOR:
             doctor=DoctorProfile.objects.create(user=user,department=department,title=title,specialty=specialty);doctor.departments.add(department)
         elif user.role==User.Role.PATIENT:PatientProfile.objects.create(user=user,gender=gender,birth_date=birth_date,address=address)
+        elif user.role in {User.Role.STAFF,User.Role.NURSE}:
+            user.department=department;user.save(update_fields=['department','updated_at'])
         return user
     def update(self,user,data):
         department=data.pop('department',None);title=data.pop('title',None);specialty=data.pop('specialty',None);password=data.pop('password',None)
         gender=data.pop('patient_gender',None);birth_date=data.pop('patient_birth_date',None);address=data.pop('patient_address',None)
         if 'role' in data and data['role']!=user.role:raise serializers.ValidationError({'role':'已有账户不可直接更换角色。'})
         for key,value in data.items():setattr(user,key,value)
+        if department is not None and user.role in {User.Role.STAFF,User.Role.NURSE}:user.department=department
         if password:user.set_password(password)
         user.save()
         doctor=self._doctor(user)
@@ -164,10 +173,13 @@ class AppointmentSerializer(serializers.ModelSerializer):
     slot=SlotSerializer(read_only=True);slot_id=serializers.PrimaryKeyRelatedField(source='selected_slot',queryset=AppointmentSlot.objects.all(),write_only=True,required=False)
     patient_name=serializers.CharField(source='patient.user.get_full_name',read_only=True);patient_no=serializers.CharField(source='patient.patient_no',read_only=True);patient_phone=serializers.CharField(source='patient.user.phone',read_only=True);patient_gender_display=serializers.CharField(source='patient.get_gender_display',read_only=True);patient_allergies=serializers.CharField(source='patient.allergies',read_only=True)
     doctor_name=serializers.CharField(source='doctor.user.get_full_name',read_only=True);doctor_title=serializers.CharField(source='doctor.title',read_only=True);doctor_specialty=serializers.CharField(source='doctor.specialty',read_only=True);doctor_introduction=serializers.CharField(source='doctor.introduction',read_only=True)
-    department_name=serializers.SerializerMethodField();status_display=serializers.CharField(source='get_status_display',read_only=True);visit_date=serializers.DateField(source='slot.schedule.date',read_only=True)
+    department_name=serializers.SerializerMethodField();status_display=serializers.CharField(source='get_status_display',read_only=True);visit_date=serializers.SerializerMethodField();visit_time=serializers.SerializerMethodField()
+    visit_type_display=serializers.CharField(source='get_visit_type_display',read_only=True);source_display=serializers.CharField(source='get_source_display',read_only=True);is_emergency=serializers.BooleanField(read_only=True)
     record_id=serializers.SerializerMethodField();record_no=serializers.SerializerMethodField();record_status=serializers.SerializerMethodField();record_status_display=serializers.SerializerMethodField()
-    class Meta:model=Appointment;fields=('id','appointment_no','patient_id','patient_name','patient_no','patient_phone','patient_gender_display','patient_allergies','doctor_id','doctor_name','doctor_title','doctor_specialty','doctor_introduction','department_id','department_name','slot','slot_id','visit_date','status','status_display','reason','record_id','record_no','record_status','record_status_display','created_at');read_only_fields=('appointment_no','status','created_at','department_id')
+    class Meta:model=Appointment;fields=('id','appointment_no','patient_id','patient_name','patient_no','patient_phone','patient_gender_display','patient_allergies','doctor_id','doctor_name','doctor_title','doctor_specialty','doctor_introduction','department_id','department_name','slot','slot_id','visit_date','visit_time','visit_type','visit_type_display','source','source_display','triage_level','arrived_at','is_emergency','status','status_display','reason','record_id','record_no','record_status','record_status_display','created_at');read_only_fields=('appointment_no','status','created_at','department_id')
     def get_department_name(self,obj):return obj.department.name if obj.department_id else obj.doctor.department.name
+    def get_visit_date(self,obj):return obj.visit_date.isoformat() if obj.visit_date else None
+    def get_visit_time(self,obj):return obj.visit_time.strftime('%H:%M') if obj.visit_time else None
     def _record(self,obj):
         try:return obj.medical_record
         except MedicalRecord.DoesNotExist:return None
@@ -189,9 +201,10 @@ class CorrectionSerializer(serializers.ModelSerializer):
 class MedicalRecordSerializer(serializers.ModelSerializer):
     appointment_id=serializers.PrimaryKeyRelatedField(source='appointment',queryset=Appointment.objects.all())
     patient_id=serializers.IntegerField(source='appointment.patient_id',read_only=True);patient_no=serializers.CharField(source='appointment.patient.patient_no',read_only=True);patient_name=serializers.CharField(source='appointment.patient.user.get_full_name',read_only=True);doctor_name=serializers.CharField(source='appointment.doctor.user.get_full_name',read_only=True);doctor_title=serializers.CharField(source='appointment.doctor.title',read_only=True)
-    visit_at=serializers.DateField(source='appointment.slot.schedule.date',read_only=True);appointment_status=serializers.CharField(source='appointment.status',read_only=True);corrections=CorrectionSerializer(many=True,read_only=True)
-    department_id=serializers.SerializerMethodField();department_name=serializers.SerializerMethodField();examinations=serializers.SerializerMethodField();prescription_count=serializers.SerializerMethodField();admission_count=serializers.SerializerMethodField()
-    class Meta:model=MedicalRecord;fields=('id','record_no','appointment_id','patient_id','patient_no','appointment_status','patient_name','doctor_name','doctor_title','department_id','department_name','visit_at','chief_complaint','present_illness','past_history','examination','diagnosis','treatment','status','confirmed_at','updated_at','corrections','examinations','prescription_count','admission_count');read_only_fields=('record_no','patient_id','status','confirmed_at','updated_at','department_id','department_name','examinations','prescription_count','admission_count')
+    visit_at=serializers.SerializerMethodField();appointment_status=serializers.CharField(source='appointment.status',read_only=True);corrections=CorrectionSerializer(many=True,read_only=True)
+    department_id=serializers.SerializerMethodField();department_name=serializers.SerializerMethodField();examinations=serializers.SerializerMethodField();prescription_count=serializers.SerializerMethodField();admission_count=serializers.SerializerMethodField();procedure_count=serializers.SerializerMethodField()
+    class Meta:model=MedicalRecord;fields=('id','record_no','appointment_id','patient_id','patient_no','appointment_status','patient_name','doctor_name','doctor_title','department_id','department_name','visit_at','chief_complaint','present_illness','past_history','examination','diagnosis','treatment','status','confirmed_at','updated_at','corrections','examinations','prescription_count','admission_count','procedure_count');read_only_fields=('record_no','patient_id','status','confirmed_at','updated_at','department_id','department_name','examinations','prescription_count','admission_count','procedure_count')
+    def get_visit_at(self,obj):return obj.appointment.visit_date.isoformat() if obj.appointment_id else None
     def get_department_id(self,obj):return obj.appointment.department_id or obj.appointment.doctor.department_id
     def get_department_name(self,obj):
         department=obj.appointment.department or obj.appointment.doctor.department
@@ -208,6 +221,7 @@ class MedicalRecordSerializer(serializers.ModelSerializer):
             rows.append({'id':order.pk,'order_no':order.order_no,'item_name':order.item_name_snapshot or (order.item.name if order.item_id else ''),'type':order.type,'type_display':order.get_type_display(),'status':order.status,'status_display':order.get_status_display(),'clinical_question':order.clinical_question,'created_at':order.created_at,'completed_at':order.completed_at,'report':None if report is None else {'id':report.pk,'findings':report.findings,'conclusion':report.conclusion,'status':report.status,'published_at':report.published_at},'files':[{'id':item.pk,'original_name':item.original_name,'file_type':item.file_type,'size':item.size,'uploaded_at':item.uploaded_at,'download_url':request.build_absolute_uri(f'/api/v1/medical-files/{item.pk}/download/') if request else None} for item in order.files.all()]})
         return rows
     def get_prescription_count(self,obj):return obj.prescriptions.count()
+    def get_procedure_count(self,obj):return obj.procedure_orders.count()
     def get_admission_count(self,obj):return obj.appointment.admissions.count()
     def validate_appointment(self,value):
         user=self.context['request'].user
@@ -240,14 +254,18 @@ class BillingSerializer(serializers.ModelSerializer):
     patient_id=serializers.PrimaryKeyRelatedField(source='patient',queryset=PatientProfile.objects.all());appointment_id=serializers.PrimaryKeyRelatedField(source='appointment',queryset=Appointment.objects.all(),required=False,allow_null=True)
     admission_id=serializers.PrimaryKeyRelatedField(source='inpatient_admission',queryset=InpatientAdmission.objects.all(),required=False,allow_null=True)
     patient_name=serializers.CharField(source='patient.user.get_full_name',read_only=True);category_display=serializers.CharField(source='get_category_display',read_only=True);status_display=serializers.CharField(source='get_status_display',read_only=True);prescription_no=serializers.CharField(source='prescription.prescription_no',read_only=True)
-    prescription_id=serializers.IntegerField(read_only=True);examination_id=serializers.IntegerField(read_only=True);admission_id_display=serializers.IntegerField(source='admission_id',read_only=True)
-    examination_no=serializers.CharField(source='examination.order_no',read_only=True);examination_item_name=serializers.CharField(source='examination.item_name_snapshot',read_only=True,default=None);admission_no=serializers.CharField(source='admission.admission_no',read_only=True);inpatient_admission_no=serializers.CharField(source='inpatient_admission.admission_no',read_only=True,default=None);source_type=serializers.SerializerMethodField()
+    prescription_id=serializers.IntegerField(read_only=True);examination_id=serializers.IntegerField(read_only=True);procedure_id=serializers.IntegerField(read_only=True);admission_id_display=serializers.IntegerField(source='admission_id',read_only=True)
+    examination_no=serializers.CharField(source='examination.order_no',read_only=True);examination_item_name=serializers.CharField(source='examination.item_name_snapshot',read_only=True,default=None)
+    procedure_no=serializers.SerializerMethodField();procedure_item_name=serializers.SerializerMethodField()
+    refund_no=serializers.SerializerMethodField()
+    admission_no=serializers.CharField(source='admission.admission_no',read_only=True);inpatient_admission_no=serializers.CharField(source='inpatient_admission.admission_no',read_only=True,default=None);source_type=serializers.SerializerMethodField()
     charge_date=serializers.SerializerMethodField();charge_date_display=serializers.SerializerMethodField();payment_date=serializers.SerializerMethodField();unit_price=serializers.SerializerMethodField();payable=serializers.SerializerMethodField();days_admitted=serializers.IntegerField(read_only=True)
     charge_kind=serializers.SerializerMethodField();charge_details=serializers.SerializerMethodField()
-    class Meta:model=BillingRecord;fields=('id','bill_no','patient_id','patient_name','appointment_id','prescription_id','prescription_no','examination_id','examination_no','examination_item_name','admission_id','admission_id_display','admission_no','inpatient_admission_no','source_type','category','category_display','description','amount','unit_price','charge_kind','charge_details','days_admitted','charge_date','charge_date_display','payment_date','payable','status','status_display','payment_method','paid_at','created_at');read_only_fields=('bill_no','status','payment_method','paid_at','created_at','unit_price','charge_kind','charge_details','charge_date','charge_date_display','payment_date','payable','days_admitted','inpatient_admission_no','admission_id_display','examination_item_name')
+    class Meta:model=BillingRecord;fields=('id','bill_no','patient_id','patient_name','appointment_id','prescription_id','prescription_no','examination_id','examination_no','examination_item_name','procedure_id','procedure_no','procedure_item_name','refund_no','admission_id','admission_id_display','admission_no','inpatient_admission_no','source_type','category','category_display','description','amount','unit_price','charge_kind','charge_details','days_admitted','charge_date','charge_date_display','payment_date','payable','status','status_display','payment_method','paid_at','created_at');read_only_fields=('bill_no','status','payment_method','paid_at','created_at','unit_price','charge_kind','charge_details','charge_date','charge_date_display','payment_date','payable','days_admitted','inpatient_admission_no','admission_id_display','examination_item_name','refund_no')
     def get_source_type(self,obj):
         if obj.prescription_id:return 'prescription'
         if obj.examination_id:return 'examination'
+        if obj.procedure_id:return 'procedure'
         if obj.admission_id:return 'admission'
         return 'manual'
     def get_charge_date(self,obj):
@@ -264,12 +282,22 @@ class BillingSerializer(serializers.ModelSerializer):
             if len(items)==1:return str(prescription_item_unit_price(items[0]))
         return str(obj.amount)
     def get_payable(self,obj):return obj.status==BillingRecord.Status.UNPAID
+    def get_procedure_no(self,obj):
+        try:return obj.procedure.order_no if obj.procedure else None
+        except ProcedureOrder.DoesNotExist:return None
+    def get_procedure_item_name(self,obj):
+        try:return obj.procedure.item_name_snapshot if obj.procedure else None
+        except ProcedureOrder.DoesNotExist:return None
+    def get_refund_no(self,obj):
+        try:return obj.refund.refund_no if obj.refund else None
+        except RefundRecord.DoesNotExist:return None
     def get_charge_kind(self,obj):
         if obj.prescription_id:
             items=list(obj.prescription.items.all())
             return 'prescription' if items and all(item.unit_price_snapshot is not None for item in items) else 'prescription_legacy'
         if obj.admission_id:return 'inpatient_bed'
         if obj.examination_id:return 'examination'
+        if obj.procedure_id:return 'procedure'
         return 'manual'
     def get_charge_details(self,obj):
         """真实费用明细行：多药品处方按药品拆行；历史缺少快照的处方回退为原账单汇总行。"""
@@ -295,11 +323,21 @@ class InpatientSerializer(serializers.ModelSerializer):
     bed_ward_name=serializers.CharField(source='bed.ward_name',read_only=True,default=None);bed_no_display=serializers.CharField(source='bed.bed_no',read_only=True,default=None);bed_daily_rate=serializers.DecimalField(source='bed.daily_rate',max_digits=10,decimal_places=2,read_only=True,default=None)
     days_admitted=serializers.IntegerField(read_only=True);projected_bed_fee=serializers.DecimalField(max_digits=10,decimal_places=2,read_only=True);billable_days=serializers.IntegerField(read_only=True)
     charge_summary=serializers.SerializerMethodField();timeline=serializers.SerializerMethodField()
-    class Meta:model=InpatientAdmission;fields=('id','admission_no','patient_id','patient_no','patient_name','doctor_id','doctor_name','department_id','department_name','appointment_id','bed_id','bed_display','bed_ward_name','bed_no_display','bed_daily_rate','ward','bed_no','daily_rate_snapshot','days_admitted','billable_days','projected_bed_fee','admission_diagnosis','discharge_summary','status','status_display','admitted_at','discharged_at','created_at','updated_at','charge_summary','timeline');read_only_fields=('admission_no','status','ward','bed_no','daily_rate_snapshot','admitted_at','discharged_at','created_at','updated_at','days_admitted','billable_days','projected_bed_fee','charge_summary','timeline')
+    receiving_nurse_name=serializers.SerializerMethodField();admission_staff_name=serializers.SerializerMethodField()
+    has_inpatient_record=serializers.SerializerMethodField();order_counts=serializers.SerializerMethodField()
+    class Meta:model=InpatientAdmission;fields=('id','admission_no','patient_id','patient_no','patient_name','doctor_id','doctor_name','department_id','department_name','appointment_id','bed_id','bed_display','bed_ward_name','bed_no_display','bed_daily_rate','ward','bed_no','daily_rate_snapshot','days_admitted','billable_days','projected_bed_fee','admission_diagnosis','discharge_summary','status','status_display','admitted_at','discharged_at','received_at','receiving_nurse_name','admission_staff_name','has_inpatient_record','order_counts','created_at','updated_at','charge_summary','timeline');read_only_fields=('admission_no','status','ward','bed_no','daily_rate_snapshot','admitted_at','discharged_at','received_at','created_at','updated_at','days_admitted','billable_days','projected_bed_fee','charge_summary','timeline')
+    def get_receiving_nurse_name(self,obj):return obj.receiving_nurse.get_full_name() if obj.receiving_nurse_id else None
+    def get_admission_staff_name(self,obj):return obj.admission_staff.get_full_name() if obj.admission_staff_id else None
+    def get_has_inpatient_record(self,obj):
+        try:return bool(obj.inpatient_record)
+        except InpatientRecord.DoesNotExist:return False
+    def get_order_counts(self,obj):
+        rows=obj.orders.values('order_type').annotate(value=Count('id'))
+        return {row['order_type']:row['value'] for row in rows}
     def get_charge_summary(self,obj):
         totals=self.context.get('charge_totals') if isinstance(self.context,dict) else None
         if totals is None:
-            rows=BillingRecord.objects.filter(inpatient_admission=obj).exclude(status=BillingRecord.Status.CANCELLED).values('status').annotate(total=Sum('amount'))
+            rows=BillingRecord.objects.filter(inpatient_admission=obj).exclude(status__in=[BillingRecord.Status.CANCELLED,BillingRecord.Status.REFUNDED]).values('status').annotate(total=Sum('amount'))
             totals={row['status']:row['total'] or Decimal('0') for row in rows}
         def money(value):return str(Decimal(value).quantize(Decimal('0.01')))
         billed=sum((amount for amount in totals.values()),Decimal('0'))
@@ -341,7 +379,7 @@ class InpatientChargeSummarySerializer(serializers.ModelSerializer):
     charge_summary=serializers.SerializerMethodField();category_totals=serializers.SerializerMethodField()
     class Meta:model=InpatientAdmission;fields=('id','admission_no','patient_name','patient_no','doctor_name','department_name','status','status_display','ward','bed_no','daily_rate_snapshot','admission_diagnosis','discharge_summary','admitted_at','discharged_at','days_admitted','billable_days','projected_bed_fee','charge_summary','category_totals')
     def get_category_totals(self,obj):
-        rows=BillingRecord.objects.filter(inpatient_admission=obj).exclude(status=BillingRecord.Status.CANCELLED).values('category').annotate(total=Sum('amount'))
+        rows=BillingRecord.objects.filter(inpatient_admission=obj).exclude(status__in=[BillingRecord.Status.CANCELLED,BillingRecord.Status.REFUNDED]).values('category').annotate(total=Sum('amount'))
         return [{'category':row['category'],'label':dict(BillingRecord.Category.choices).get(row['category'],row['category']),'total':str(row['total'] or 0)} for row in rows]
     def get_charge_summary(self,obj):return InpatientSerializer().get_charge_summary(obj)
 
@@ -376,15 +414,17 @@ def prescription_item_amounts(items,total):
 
 class PrescriptionItemSerializer(serializers.ModelSerializer):
     medicine_id=serializers.PrimaryKeyRelatedField(source='medicine',queryset=Medicine.objects.filter(is_active=True));medicine_name=serializers.CharField(source='medicine.name',read_only=True);specification=serializers.CharField(source='medicine.specification',read_only=True)
-    unit_price=serializers.SerializerMethodField()
-    class Meta:model=PrescriptionItem;fields=('id','medicine_id','medicine_name','specification','dosage','frequency','duration','quantity','unit_price_snapshot','unit_price')
+    unit_price=serializers.SerializerMethodField();stock=serializers.SerializerMethodField()
+    class Meta:model=PrescriptionItem;fields=('id','medicine_id','medicine_name','specification','dosage','frequency','duration','quantity','unit_price_snapshot','unit_price','stock')
     def get_unit_price(self,obj):return str(prescription_item_unit_price(obj))
+    def get_stock(self,obj):return obj.medicine.stock
 
 class PrescriptionSerializer(serializers.ModelSerializer):
     record_id=serializers.PrimaryKeyRelatedField(source='record',queryset=MedicalRecord.objects.all());items=PrescriptionItemSerializer(many=True)
     admission_id=serializers.IntegerField(required=False,allow_null=True)
     patient_name=serializers.CharField(source='record.appointment.patient.user.get_full_name',read_only=True);doctor_name=serializers.CharField(source='doctor.user.get_full_name',read_only=True);diagnosis=serializers.CharField(source='record.diagnosis',read_only=True);bill_no=serializers.SerializerMethodField();total_amount=serializers.SerializerMethodField();admission_no=serializers.SerializerMethodField()
-    class Meta:model=Prescription;fields=('id','prescription_no','record_id','patient_name','doctor_name','diagnosis','status','items','notes','bill_no','total_amount','admission_id','admission_no','dispensed_at','created_at');read_only_fields=('prescription_no','status','bill_no','total_amount','admission_no','dispensed_at','created_at')
+    payment_status=serializers.SerializerMethodField();fulfillment_status=serializers.SerializerMethodField();dispensed_by_name=serializers.SerializerMethodField();execution_department_name=serializers.SerializerMethodField()
+    class Meta:model=Prescription;fields=('id','prescription_no','record_id','patient_name','doctor_name','diagnosis','status','items','notes','bill_no','total_amount','admission_id','admission_no','payment_status','fulfillment_status','dispensed_by_name','execution_department_name','dispensed_at','created_at');read_only_fields=('prescription_no','status','bill_no','total_amount','admission_no','dispensed_at','created_at')
     def to_representation(self,instance):
         data=super().to_representation(instance)
         try:data['admission_id']=instance.billing_record.inpatient_admission_id
@@ -397,6 +437,19 @@ class PrescriptionSerializer(serializers.ModelSerializer):
     def get_admission_no(self,obj):
         try:return obj.billing_record.inpatient_admission.admission_no
         except (BillingRecord.DoesNotExist,AttributeError):return None
+    def get_payment_status(self,obj):
+        try:return obj.billing_record.status
+        except BillingRecord.DoesNotExist:return None
+    def get_dispensed_by_name(self,obj):return obj.dispensed_by.get_full_name() if obj.dispensed_by_id else None
+    def get_execution_department_name(self,obj):return obj.execution_department.name if obj.execution_department_id else None
+    def get_fulfillment_status(self,obj):
+        if obj.status==Prescription.Status.DISPENSED:return 'dispensed'
+        if obj.status==Prescription.Status.CANCELLED:return 'cancelled'
+        try:bill=obj.billing_record
+        except BillingRecord.DoesNotExist:return 'no_bill'
+        if bill.status==BillingRecord.Status.PAID:return 'to_dispense'
+        if bill.status==BillingRecord.Status.REFUNDED:return 'refunded'
+        return 'unpaid'
     def validate_record(self,record):
         user=self.context['request'].user
         if user.role!=User.Role.DOCTOR or record.appointment.doctor.user_id!=user.id:raise serializers.ValidationError('只能为本人确认的病历开具处方。')
@@ -424,10 +477,26 @@ class ExaminationSerializer(serializers.ModelSerializer):
     record_id=serializers.PrimaryKeyRelatedField(source='record',queryset=MedicalRecord.objects.all(),write_only=True);item_id=serializers.PrimaryKeyRelatedField(source='item',queryset=ExaminationItem.objects.filter(is_active=True),write_only=True,required=False)
     admission_id=serializers.IntegerField(write_only=True,required=False,allow_null=True)
     patient_id=serializers.IntegerField(read_only=True);patient_no=serializers.CharField(source='patient.patient_no',read_only=True);patient_name=serializers.CharField(source='patient.user.get_full_name',read_only=True);doctor_name=serializers.CharField(source='doctor.user.get_full_name',read_only=True);type_display=serializers.CharField(source='get_type_display',read_only=True);status_display=serializers.CharField(source='get_status_display',read_only=True);report=ReportSerializer(read_only=True);files=MedicalFileSerializer(many=True,read_only=True)
-    record_no=serializers.CharField(source='record.record_no',read_only=True);record_pk=serializers.IntegerField(source='record_id',read_only=True);record_diagnosis=serializers.CharField(source='record.diagnosis',read_only=True);visit_date=serializers.DateField(source='record.appointment.slot.schedule.date',read_only=True)
+    record_no=serializers.CharField(source='record.record_no',read_only=True);record_pk=serializers.IntegerField(source='record_id',read_only=True);record_diagnosis=serializers.CharField(source='record.diagnosis',read_only=True);visit_date=serializers.SerializerMethodField()
     department_id=serializers.SerializerMethodField();department_name=serializers.SerializerMethodField();published_at=serializers.SerializerMethodField()
-    admission_no=serializers.SerializerMethodField()
-    class Meta:model=ExaminationOrder;fields=('id','order_no','record_id','record_pk','record_no','record_diagnosis','visit_date','item_id','item_name_snapshot','price_snapshot','patient_id','patient_no','patient_name','doctor_name','department_id','department_name','type','type_display','status','status_display','clinical_question','completed_at','published_at','created_at','report','files','admission_id','admission_no');read_only_fields=('order_no','record_pk','item_name_snapshot','price_snapshot','status','completed_at','published_at','created_at','admission_no','patient_id','department_id','department_name')
+    admission_no=serializers.SerializerMethodField();payment_status=serializers.SerializerMethodField();fulfillment_status=serializers.SerializerMethodField();started_by_name=serializers.SerializerMethodField();execution_department_name=serializers.SerializerMethodField()
+    class Meta:model=ExaminationOrder;fields=('id','order_no','record_id','record_pk','record_no','record_diagnosis','visit_date','item_id','item_name_snapshot','price_snapshot','patient_id','patient_no','patient_name','doctor_name','department_id','department_name','type','type_display','status','status_display','clinical_question','completed_at','published_at','payment_status','fulfillment_status','started_by_name','started_at','execution_department_name','created_at','report','files','admission_id','admission_no');read_only_fields=('order_no','record_pk','item_name_snapshot','price_snapshot','status','completed_at','published_at','created_at','admission_no','patient_id','department_id','department_name')
+    def get_visit_date(self,obj):return obj.record.appointment.visit_date.isoformat() if obj.record_id and obj.record.appointment_id else None
+    def get_payment_status(self,obj):
+        try:return obj.billing_record.status
+        except BillingRecord.DoesNotExist:return None
+    def get_started_by_name(self,obj):return obj.started_by.get_full_name() if obj.started_by_id else None
+    def get_execution_department_name(self,obj):return obj.execution_department.name if obj.execution_department_id else None
+    def get_fulfillment_status(self,obj):
+        if obj.status==ExaminationOrder.Status.PUBLISHED:return 'published'
+        if obj.status==ExaminationOrder.Status.COMPLETED:return 'report_pending'
+        if obj.status==ExaminationOrder.Status.IN_PROGRESS:return 'in_progress'
+        if obj.status==ExaminationOrder.Status.CANCELLED:return 'cancelled'
+        try:bill=obj.billing_record
+        except BillingRecord.DoesNotExist:return 'no_bill'
+        if bill.status==BillingRecord.Status.PAID:return 'to_execute'
+        if bill.status==BillingRecord.Status.REFUNDED:return 'refunded'
+        return 'unpaid'
     def get_department_id(self,obj):
         appointment=obj.record.appointment
         return appointment.department_id or appointment.doctor.department_id
@@ -462,3 +531,72 @@ class AIServiceSerializer(serializers.ModelSerializer):
 
 class AITaskSerializer(serializers.ModelSerializer):
     class Meta:model=AIAnalysisTask;fields=('id','patient','file','service','status','result','error_message','created_at','updated_at');read_only_fields=('patient','status','result','error_message','created_at','updated_at')
+
+class ProcedureItemSerializer(serializers.ModelSerializer):
+    category_display=serializers.CharField(source='get_category_display',read_only=True);execution_department_name=serializers.CharField(source='execution_department.name',read_only=True,default=None)
+    class Meta:model=ProcedureItem;fields=('id','name','category','category_display','price','execution_department','execution_department_name','is_active','description','created_at');read_only_fields=('created_at',)
+
+class ProcedureOrderSerializer(serializers.ModelSerializer):
+    record_id=serializers.PrimaryKeyRelatedField(source='record',queryset=MedicalRecord.objects.all(),write_only=True);item_id=serializers.PrimaryKeyRelatedField(source='item',queryset=ProcedureItem.objects.filter(is_active=True),write_only=True,required=False,allow_null=True)
+    admission_id=serializers.IntegerField(write_only=True,required=False,allow_null=True)
+    patient_id=serializers.IntegerField(read_only=True);patient_no=serializers.CharField(source='patient.patient_no',read_only=True);patient_name=serializers.CharField(source='patient.user.get_full_name',read_only=True);doctor_name=serializers.CharField(source='doctor.user.get_full_name',read_only=True)
+    record_no=serializers.CharField(source='record.record_no',read_only=True);record_pk=serializers.IntegerField(source='record_id',read_only=True);visit_date=serializers.SerializerMethodField();category_display=serializers.CharField(source='get_category_display',read_only=True);status_display=serializers.CharField(source='get_status_display',read_only=True)
+    payment_status=serializers.SerializerMethodField();fulfillment_status=serializers.SerializerMethodField();executed_by_name=serializers.SerializerMethodField();execution_department_name=serializers.SerializerMethodField();bill_no=serializers.SerializerMethodField()
+    class Meta:model=ProcedureOrder;fields=('id','order_no','record_id','record_pk','record_no','visit_date','item_id','admission_id','item_name_snapshot','price_snapshot','category','category_display','clinical_note','status','status_display','patient_id','patient_no','patient_name','doctor_name','payment_status','fulfillment_status','executed_by_name','executed_at','execution_note','execution_department_name','bill_no','created_at');read_only_fields=('order_no','record_pk','item_name_snapshot','price_snapshot','category','status','patient_id','doctor_name','created_at')
+    def get_visit_date(self,obj):return obj.record.appointment.visit_date.isoformat() if obj.record_id and obj.record.appointment_id else None
+    def get_payment_status(self,obj):
+        try:return obj.billing_record.status
+        except BillingRecord.DoesNotExist:return None
+    def get_fulfillment_status(self,obj):
+        if obj.status==ProcedureOrder.Status.COMPLETED:return 'completed'
+        if obj.status==ProcedureOrder.Status.IN_PROGRESS:return 'in_progress'
+        if obj.status==ProcedureOrder.Status.CANCELLED:return 'cancelled'
+        try:bill=obj.billing_record
+        except BillingRecord.DoesNotExist:return 'no_bill'
+        if bill.status==BillingRecord.Status.PAID:return 'to_execute'
+        if bill.status==BillingRecord.Status.REFUNDED:return 'refunded'
+        return 'unpaid'
+    def get_executed_by_name(self,obj):return obj.executed_by.get_full_name() if obj.executed_by_id else None
+    def get_execution_department_name(self,obj):return obj.execution_department.name if obj.execution_department_id else None
+    def get_bill_no(self,obj):
+        try:return obj.billing_record.bill_no
+        except BillingRecord.DoesNotExist:return None
+    def validate_record(self,record):
+        user=self.context['request'].user
+        if user.role!=User.Role.DOCTOR or record.appointment.doctor.user_id!=user.id:raise serializers.ValidationError('只能为本人患者开具处置。')
+        if record.status!=MedicalRecord.Status.CONFIRMED:raise serializers.ValidationError('病历确认后才能开具处置。')
+        return record
+    @transaction.atomic
+    def create(self,data):
+        record=data.pop('record');admission_id=data.pop('admission_id',None);item=data.pop('item',None)
+        data.pop('category',None);order=ProcedureOrder.objects.create(record=record,patient=record.appointment.patient,doctor=self.context['request'].user.doctor_profile,item=item,item_name_snapshot=item.name if item else '',price_snapshot=item.price if item else 0,category=item.category if item else ProcedureItem.Category.OTHER,execution_department=item.execution_department if item else None,**data)
+        if item:
+            admission=link_inpatient(patient=order.patient,admission_id=admission_id,appointment=record.appointment)
+            BillingRecord.objects.create(patient=order.patient,appointment=record.appointment,procedure=order,inpatient_admission=admission,category=BillingRecord.Category.PROCEDURE,description=f'处置 {order.order_no}：{item.name}'[:200],amount=item.price)
+        return order
+
+class InpatientRecordSerializer(serializers.ModelSerializer):
+    created_by_name=serializers.CharField(source='created_by.get_full_name',read_only=True,default=None)
+    class Meta:model=InpatientRecord;fields=('id','admission','chief_complaint','present_illness','past_history','physical_exam','diagnosis','course','discharge_summary','created_by_name','updated_at');read_only_fields=('created_by_name','updated_at')
+
+class InpatientOrderSerializer(serializers.ModelSerializer):
+    order_type_display=serializers.CharField(source='get_order_type_display',read_only=True);category_display=serializers.CharField(source='get_category_display',read_only=True);status_display=serializers.CharField(source='get_status_display',read_only=True)
+    prescriber_name=serializers.SerializerMethodField();executor_name=serializers.SerializerMethodField()
+    class Meta:model=InpatientOrder;fields=('id','admission','order_type','order_type_display','category','category_display','content','dosage','frequency','start_at','stop_at','status','status_display','prescriber_name','executor_name','executed_at','execution_note','created_at');read_only_fields=('prescriber_name','executor_name','executed_at','status','created_at')
+    def get_prescriber_name(self,obj):return obj.prescriber.get_full_name() if obj.prescriber_id else None
+    def get_executor_name(self,obj):return obj.executor.get_full_name() if obj.executor_id else None
+
+class RecordTemplateSerializer(serializers.ModelSerializer):
+    department_name=serializers.CharField(source='department.name',read_only=True,default=None)
+    class Meta:model=RecordTemplate;fields=('id','department','department_name','name','diagnosis','chief_complaint','present_illness','past_history','examination','treatment','variables','is_active','created_at');read_only_fields=('created_at',)
+
+class RefundSerializer(serializers.ModelSerializer):
+    operator_name=serializers.CharField(source='operator.get_full_name',read_only=True);bill_no=serializers.CharField(source='bill.bill_no',read_only=True)
+    class Meta:model=RefundRecord;fields=('id','refund_no','bill','bill_no','amount','reason','operator_name','status','refunded_at','created_at');read_only_fields=('refund_no','operator_name','status','refunded_at','created_at')
+
+class ReportShareTokenSerializer(serializers.ModelSerializer):
+    url=serializers.SerializerMethodField()
+    class Meta:model=ReportShareToken;fields=('id','token','expires_at','access_count','revoked','url')
+    def get_url(self,obj):
+        request=self.context.get('request')
+        return request.build_absolute_uri(f'/app/share/report/{obj.token}') if request else f'/app/share/report/{obj.token}'

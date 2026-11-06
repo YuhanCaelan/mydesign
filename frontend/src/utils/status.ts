@@ -29,11 +29,18 @@ export const billingStatuses:Record<string,StatusInfo>={
   unpaid:{label:'待缴费',tone:'warning'},
   paid:{label:'已缴费',tone:'success'},
   cancelled:{label:'已取消',tone:'info'},
+  refunded:{label:'已退费',tone:'danger'},
 }
 export const prescriptionStatuses:Record<string,StatusInfo>={
   issued:{label:'待缴费取药',tone:'warning'},
   dispensed:{label:'已取药',tone:'success'},
   cancelled:{label:'已作废',tone:'info'},
+}
+export const procedureStatuses:Record<string,StatusInfo>={
+  requested:{label:'待执行',tone:'warning'},
+  in_progress:{label:'处置中',tone:'primary'},
+  completed:{label:'已完成',tone:'success'},
+  cancelled:{label:'已取消',tone:'info'},
 }
 export const slotStatuses:Record<string,StatusInfo>={
   available:{label:'可预约',tone:'success'},
@@ -41,10 +48,10 @@ export const slotStatuses:Record<string,StatusInfo>={
   closed:{label:'已关闭',tone:'info'},
 }
 
-export type StatusDomain='appointment'|'record'|'examination'|'inpatient'|'billing'|'prescription'|'slot'
+export type StatusDomain='appointment'|'record'|'examination'|'inpatient'|'billing'|'prescription'|'procedure'|'slot'
 const maps:Record<StatusDomain,Record<string,StatusInfo>>={
   appointment:appointmentStatuses,record:recordStatuses,examination:examinationStatuses,
-  inpatient:inpatientStatuses,billing:billingStatuses,prescription:prescriptionStatuses,slot:slotStatuses,
+  inpatient:inpatientStatuses,billing:billingStatuses,prescription:prescriptionStatuses,procedure:procedureStatuses,slot:slotStatuses,
 }
 export function statusInfo(domain:StatusDomain,statusOrLabel:string):StatusInfo{
   const map=maps[domain]

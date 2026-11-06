@@ -1,5 +1,5 @@
 import {Calendar,DataAnalysis,Document,Files,FirstAidKit,House,Money,OfficeBuilding,Reading,User} from '@element-plus/icons-vue'
-import type {UserRole} from '../stores/auth'
+import type{UserRole}from'../stores/auth'
 
 export interface NavItem{label:string;path:string;icon:unknown}
 export interface NavGroup{label:string;items:NavItem[]}
@@ -7,20 +7,28 @@ const common:NavGroup[]=[{label:'概览',items:[{label:'工作台',path:'/dashbo
 
 const roleMenus:Record<UserRole,NavGroup[]>={
   admin:[
-    {label:'业务管理',items:[
-      {label:'人员与科室',path:'/console/people',icon:User},
-      {label:'门诊管理',path:'/console/outpatient',icon:Calendar},
-      {label:'医疗资源',path:'/console/clinical',icon:FirstAidKit},
-      {label:'住院管理',path:'/console/inpatient',icon:OfficeBuilding},
-      {label:'运营管理',path:'/console/operations',icon:DataAnalysis},
+    {label:'系统管理',items:[
+      {label:'账号与科室',path:'/console/people',icon:User},
+      {label:'基础字典',path:'/console/clinical?tab=exam-items',icon:FirstAidKit},
+      {label:'审计日志',path:'/console/operations?tab=audit',icon:DataAnalysis},
     ]},
   ],
   doctor:[
     {label:'诊疗工作',items:[
-      {label:'门诊工作',path:'/doctor/outpatient',icon:Calendar},
+      {label:'接诊工作',path:'/doctor/outpatient',icon:Calendar},
       {label:'诊疗档案',path:'/doctor/records',icon:Files},
       {label:'诊疗资料',path:'/doctor/clinical',icon:Document},
       {label:'住院工作',path:'/doctor/inpatient',icon:OfficeBuilding},
+    ]},
+  ],
+  nurse:[
+    {label:'护理工作',items:[
+      {label:'护理工作台',path:'/nurse',icon:FirstAidKit},
+    ]},
+  ],
+  staff:[
+    {label:'岗位工作',items:[
+      {label:'岗位工作台',path:'/staff',icon:User},
     ]},
   ],
   patient:[
@@ -32,4 +40,4 @@ const roleMenus:Record<UserRole,NavGroup[]>={
     ]},
   ],
 }
-export const navigationFor=(role:UserRole):NavGroup[]=>[...common,...roleMenus[role]]
+export const navigationFor=(role:UserRole):NavGroup[]=>role==='staff'||role==='nurse'?roleMenus[role]:[...common,...roleMenus[role]]

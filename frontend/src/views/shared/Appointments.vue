@@ -35,6 +35,7 @@ onMounted(async()=>{await load();if(isPatient.value&&(route.query.doctor||route.
 <template>
   <section>
     <div class="page-heading"><div><p class="eyebrow">APPOINTMENT WORKFLOW</p><h1>{{title}}</h1><p>{{description}}</p></div><el-button v-if="isPatient" type="primary" @click="openBooking">＋ 预约挂号</el-button></div>
+    <el-alert v-if="isPatient" title="急诊不支持预约，请直接到急诊科现场分诊" type="warning" :closable="false" show-icon class="record-alert"/>
     <el-card class="table-card">
       <div class="date-axis" role="group" aria-label="按就诊日期筛选">
         <button type="button" :class="{active:!state.date}" :aria-pressed="!state.date" @click="pickDate('')"><span>日期</span><b>全部</b><small>不限</small></button>
@@ -44,7 +45,7 @@ onMounted(async()=>{await load();if(isPatient.value&&(route.query.doctor||route.
       <div class="legend-row"><StatusLegend domain="appointment" title="预约状态"/></div>
       <ListError v-if="error" :message="error" @retry="load"/>
       <div v-else-if="state.view==='cards'" v-loading="loading" class="task-card-grid">
-        <TaskCard v-for="row in appointments" :key="row.id" :time="`${row.slot?.date} ${row.slot?.start_time?.slice(0,5)}–${row.slot?.end_time?.slice(0,5)}`" :title="isPatient?row.doctor_name:row.patient_name" :subtitle="`${row.appointment_no} · ${row.department_name}`" :accent="statusInfo('appointment',row.status).tone" :highlight="isDoctor&&row.id===queueFocus" :meta="isPatient?[{label:'医师',value:row.doctor_name},{label:'就诊原因',value:row.reason}]:[{label:'患者',value:row.patient_name},{label:'医师',value:row.doctor_name},{label:'就诊原因',value:row.reason}]">
+        <TaskCard v-for="row in appointments" :key="row.id" :time="`${row.visit_date||row.slot?.date||''} ${row.visit_time||row.slot?.start_time?.slice(0,5)||''}${row.slot?'–'+(row.slot.end_time?.slice(0,5)||''):'（急诊）'}`" :title="isPatient?row.doctor_name:row.patient_name" :subtitle="`${row.appointment_no} · ${row.department_name}`" :accent="statusInfo('appointment',row.status).tone" :highlight="isDoctor&&row.id===queueFocus" :meta="isPatient?[{label:'医师',value:row.doctor_name},{label:'就诊原因',value:row.reason}]:[{label:'患者',value:row.patient_name},{label:'医师',value:row.doctor_name},{label:'就诊原因',value:row.reason}]">
           <template #status><div class="task-status"><el-tag v-if="isDoctor&&row.status==='in_progress'" effect="dark" type="primary">诊疗中</el-tag><el-tag v-else-if="isDoctor&&row.id===queueFocus" effect="plain" type="warning">下一位</el-tag><el-tag :type="statusInfo('appointment',row.status).tone">{{statusInfo('appointment',row.status).label}}</el-tag></div></template>
           <template #actions><el-button v-if="isPatient&&row.status==='pending'" link type="danger" @click="action(row,'cancel')">取消</el-button><template v-if="isDoctor"><el-button v-if="row.status==='pending'" link type="primary" @click="action(row,'start')">接诊</el-button><el-button v-if="row.status==='pending'" link type="danger" @click="action(row,'no-show')">爽约</el-button><el-button v-if="row.status==='in_progress'" link type="primary" @click="openWorkspace(row)">工作区</el-button><el-button v-if="row.status==='in_progress'" link type="success" @click="action(row,'complete')">完成诊疗</el-button></template></template>
         </TaskCard>
@@ -56,7 +57,7 @@ onMounted(async()=>{await load();if(isPatient.value&&(route.query.doctor||route.
           <el-table-column v-if="!isPatient" prop="patient_name" label="患者" min-width="110"/>
           <el-table-column v-if="!isDoctor" prop="doctor_name" label="医师" min-width="110"/>
           <el-table-column prop="department_name" label="科室" min-width="110"/>
-          <el-table-column label="就诊时间" min-width="180"><template #default="{row}">{{row.slot?.date}} {{row.slot?.start_time?.slice(0,5)}}–{{row.slot?.end_time?.slice(0,5)}}</template></el-table-column>
+          <el-table-column label="就诊时间" min-width="180"><template #default="{row}">{{row.visit_date||row.slot?.date}} {{row.visit_time||row.slot?.start_time?.slice(0,5)}}<template v-if="row.slot">–{{row.slot.end_time?.slice(0,5)}}</template><el-tag v-else type="danger" size="small" style="margin-left:6px">急诊</el-tag></template></el-table-column>
           <el-table-column prop="reason" label="就诊原因" min-width="180" show-overflow-tooltip/>
           <el-table-column label="状态" width="100"><template #default="{row}"><el-tag :type="statusInfo('appointment',row.status).tone">{{statusInfo('appointment',row.status).label}}</el-tag></template></el-table-column>
           <el-table-column label="操作" min-width="190" fixed="right"><template #default="{row}"><el-button v-if="isPatient&&row.status==='pending'" link type="danger" @click="action(row,'cancel')">取消</el-button><template v-if="isDoctor"><el-button v-if="row.status==='pending'" link type="primary" @click="action(row,'start')">接诊</el-button><el-button v-if="row.status==='pending'" link type="danger" @click="action(row,'no-show')">爽约</el-button><el-button v-if="row.status==='in_progress'" link type="primary" @click="openWorkspace(row)">工作区</el-button><el-button v-if="row.status==='in_progress'" link type="success" @click="action(row,'complete')">完成诊疗</el-button></template></template></el-table-column>
@@ -65,7 +66,7 @@ onMounted(async()=>{await load();if(isPatient.value&&(route.query.doctor||route.
           <article v-for="row in appointments" :key="row.id" class="mobile-info-card">
             <header><h3>{{isPatient?row.doctor_name:row.patient_name}}</h3><el-tag :type="statusInfo('appointment',row.status).tone">{{statusInfo('appointment',row.status).label}}</el-tag></header>
             <p class="mobile-sub">{{row.appointment_no}} · {{row.department_name}}</p>
-            <div class="mobile-line"><span>就诊时间</span><b>{{row.slot?.date}} {{row.slot?.start_time?.slice(0,5)}}–{{row.slot?.end_time?.slice(0,5)}}</b></div>
+            <div class="mobile-line"><span>就诊时间</span><b>{{row.visit_date||row.slot?.date}} {{row.visit_time||row.slot?.start_time?.slice(0,5)}}<template v-if="row.slot">–{{row.slot.end_time?.slice(0,5)}}</template><template v-else>（急诊）</template></b></div>
             <div class="mobile-line" v-if="isPatient"><span>医师</span><b>{{row.doctor_name}}</b></div>
             <p class="mobile-sub">{{row.reason}}</p>
             <div class="actions"><el-button v-if="isPatient&&row.status==='pending'" link type="danger" @click="action(row,'cancel')">取消</el-button><template v-if="isDoctor"><el-button v-if="row.status==='pending'" link type="primary" @click="action(row,'start')">接诊</el-button><el-button v-if="row.status==='pending'" link type="danger" @click="action(row,'no-show')">爽约</el-button><el-button v-if="row.status==='in_progress'" link type="primary" @click="openWorkspace(row)">工作区</el-button><el-button v-if="row.status==='in_progress'" link type="success" @click="action(row,'complete')">完成诊疗</el-button></template></div>

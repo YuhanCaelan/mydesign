@@ -54,7 +54,9 @@ def transition_appointment(*,appointment,user,action):
     appointment.status=target
     fields=['status','updated_at']
     if target==Appointment.Status.CANCELLED:
-        appointment.cancelled_at=timezone.now();fields.append('cancelled_at');appointment.slot.status=AppointmentSlot.Status.AVAILABLE;appointment.slot.save(update_fields=['status','updated_at'])
+        appointment.cancelled_at=timezone.now();fields.append('cancelled_at')
+        if appointment.slot_id:
+            appointment.slot.status=AppointmentSlot.Status.AVAILABLE;appointment.slot.save(update_fields=['status','updated_at'])
     if target==Appointment.Status.COMPLETED:appointment.completed_at=timezone.now();fields.append('completed_at')
     appointment.save(update_fields=fields)
     return appointment
@@ -122,6 +124,7 @@ def board_bed_payload(bed,admission=None):
 def ensure_admission_operator(*,admission,user):
     """住院状态变更（入院、出院、取消）仅管理员与该次住院的主治医师可执行。"""
     if user.role==User.Role.ADMIN:return
+    if user.role==User.Role.STAFF and user.station==User.Station.ADMISSION:return
     if user.role==User.Role.DOCTOR and admission.attending_doctor.user_id==user.id:return
     if user.role==User.Role.DOCTOR:raise PermissionDenied('仅主治医师或管理员可以修改住院状态与办理出院。')
     raise PermissionDenied('无权修改住院状态。')

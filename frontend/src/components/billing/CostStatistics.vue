@@ -48,7 +48,7 @@ async function load(target=state.page){
   catch(e:any){data.value=null;error.value=errorText(e,`${label.value}加载失败`)}
   finally{loading.value=false}
 }
-async function pay(row:BillingRecord){try{await ElMessageBox.confirm(row.prescription_no?`确认支付 ¥${row.amount}？支付后将自动发药并扣减库存。`:`确认结算 ¥${row.amount}？`,'费用结算',{type:'info'});await payBill(row.id);ElMessage.success(row.prescription_no?'支付成功，药品已发放':'结算成功');await load(state.page)}catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(errorText(e,'结算失败'))}}
+async function pay(row:BillingRecord){try{await ElMessageBox.confirm(row.prescription_no?`确认支付 ¥${row.amount}？支付后由药房确认发药。`:`确认结算 ¥${row.amount}？`,'费用结算',{type:'info'});await payBill(row.id);ElMessage.success(row.prescription_no?'支付成功，等待药房发药':'结算成功');await load(state.page)}catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(errorText(e,'结算失败'))}}
 async function cancel(row:BillingRecord){try{await ElMessageBox.confirm('取消后该账单将不计入有效费用合计。','取消账单',{type:'warning'});await cancelBill(row.id);ElMessage.success('账单已取消');await load(state.page)}catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(errorText(e,'取消失败'))}}
 function money(value?:string|number|null){return value===null||value===undefined?'—':`¥${Number(value||0).toFixed(2)}`}
 function medicineSummary(row:BillingRecord){if(row.source_type!=='prescription')return'手工药品费用';const details=row.charge_details||[];if(!details.length||details.some(line=>!line.price_snapshot))return'历史处方明细';return details.map(line=>line.medicine_name).filter(Boolean).join('、')||'药品明细'}

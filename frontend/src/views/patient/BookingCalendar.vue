@@ -76,7 +76,7 @@ onMounted(load)
     <div class="page-heading"><div><h1>排班预约</h1><p>选择科室与日期，查看医师出诊安排，再选择具体号源预约</p></div><el-button @click="viewAppointments">我的预约</el-button></div>
     <el-alert v-if="success" class="booking-success" type="success" :closable="false" show-icon>
       <template #title>预约成功 · {{success.appointment_no}}</template>
-      <p>{{success.department_name}} · {{success.doctor_name}} · {{success.slot.date}} {{success.slot.start_time.slice(0,5)}}–{{success.slot.end_time.slice(0,5)}}</p>
+      <p>{{success.department_name}} · {{success.doctor_name}} · {{success.visit_date||success.slot?.date}} {{success.visit_time||success.slot?.start_time.slice(0,5)}}–{{success.slot?.end_time.slice(0,5)}}</p>
       <el-button link type="primary" @click="viewAppointments">查看我的预约 →</el-button>
     </el-alert>
     <ListError v-if="error" :message="error" @retry="load"/>

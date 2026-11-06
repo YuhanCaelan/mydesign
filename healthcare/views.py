@@ -1,8 +1,10 @@
 import mimetypes
+import secrets
 from datetime import date as date_cls,timedelta
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Count,F,Max,Q,Sum
+from django.db.models import Case,Count,F,Max,Q,Sum,When
+from django.db.models.functions import Coalesce
 from django.http import FileResponse,Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -13,7 +15,7 @@ from rest_framework.permissions import AllowAny,IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenRefreshView
 from .models import *
-from .permissions import IsAdmin,IsAdminOrReadOnly,IsAdminWriteOrClinicalRead
+from .permissions import IsAdmin,IsAdminOrReadOnly,IsAdminWriteOrClinicalRead,can_admit,can_dispense,can_execute,can_manage_schedule,can_refund,is_admin,is_nurse,is_staff
 from .serializers import *
 from .services import VALID_RELATIONSHIP_STATUSES,admit_patient,audit,bed_status_key,board_bed_payload,bookable_slots,department_scope,ensure_admission_operator,finish_admission,has_doctor_patient_relationship,link_inpatient,record_stock_movement,transition_appointment
 
@@ -80,14 +82,14 @@ def change_password(request):
 class UserViewSet(viewsets.ModelViewSet):
     permission_classes=[IsAdmin];serializer_class=AdminUserSerializer;http_method_names=['get','post','patch','head','options']
     def get_queryset(self):
-        """业务账户列表只返回医师与患者，管理员账号不混入；角色与启用状态均支持服务端筛选。"""
-        qs=User.objects.select_related('doctor_profile__department','patient_profile').exclude(is_superuser=True).exclude(role=User.Role.ADMIN).order_by('-created_at')
+        """业务账户列表只返回医师、患者、事务员与护士；管理员账号不混入。"""
+        qs=User.objects.select_related('doctor_profile__department','patient_profile','department').exclude(is_superuser=True).exclude(role=User.Role.ADMIN).order_by('-created_at')
         role=self.request.query_params.get('role','').strip();state=self.request.query_params.get('is_active','').strip();search=self.request.query_params.get('search','').strip()
         if role:
-            if role not in {User.Role.DOCTOR,User.Role.PATIENT}:raise APIValidationError({'role':'仅支持 doctor 或 patient。'})
+            if role not in {User.Role.DOCTOR,User.Role.PATIENT,User.Role.STAFF,User.Role.NURSE}:raise APIValidationError({'role':'仅支持 doctor / patient / staff / nurse。'})
             qs=qs.filter(role=role)
         if state in {'true','false'}:qs=qs.filter(is_active=state=='true')
-        if search:qs=qs.filter(Q(username__icontains=search)|Q(first_name__icontains=search)|Q(phone__icontains=search)|Q(doctor_profile__doctor_no__icontains=search)|Q(patient_profile__patient_no__icontains=search)|Q(doctor_profile__title__icontains=search)|Q(doctor_profile__specialty__icontains=search))
+        if search:qs=qs.filter(Q(username__icontains=search)|Q(first_name__icontains=search)|Q(phone__icontains=search)|Q(department__name__icontains=search)|Q(doctor_profile__doctor_no__icontains=search)|Q(patient_profile__patient_no__icontains=search)|Q(doctor_profile__title__icontains=search)|Q(doctor_profile__specialty__icontains=search))
         return qs
     def perform_create(self,serializer):obj=serializer.save();audit(self.request,'create','user',obj,'创建业务账户')
     def perform_update(self,serializer):obj=serializer.save();audit(self.request,'update','user',obj,'更新业务账户')
@@ -216,6 +218,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         if user.role==User.Role.ADMIN:return qs
         if user.role==User.Role.PATIENT:return qs.filter(user=user)
         if user.role==User.Role.DOCTOR:return qs.filter(appointments__doctor__user=user,appointments__status__in=VALID_RELATIONSHIP_STATUSES).distinct()
+        if user.role in {User.Role.STAFF,User.Role.NURSE}:return qs
         return qs.none()
     def retrieve(self,request,*args,**kwargs):
         obj=self.get_object();audit(request,'read','patient',obj,'读取患者档案');return Response(self.get_serializer(obj).data)
@@ -237,7 +240,7 @@ class PatientViewSet(viewsets.ModelViewSet):
         if diagnosis:qs=qs.filter(diagnosis__icontains=diagnosis)
         keyword=request.query_params.get('search','').strip() or request.query_params.get('record_no','').strip()
         if keyword:qs=qs.filter(Q(record_no__icontains=keyword)|Q(diagnosis__icontains=keyword)|Q(chief_complaint__icontains=keyword))
-        qs=qs.order_by('-appointment__slot__schedule__date','-confirmed_at','-pk')
+        qs=qs.annotate(visit_day=Coalesce('appointment__slot__schedule__date','appointment__arrived_at__date','appointment__created_at__date')).order_by('-visit_day','-confirmed_at','-pk')
         page,size=page_meta(request,default_size=10,maximum=50);total,rows=page_slice(qs,page,size)
         basis='self' if user.role==User.Role.PATIENT else 'admin' if user.role==User.Role.ADMIN else 'doctor_relationship'
         audit(request,'read','patient_clinical_history',patient,f'读取患者纵向病历（{total} 份已确认）')
@@ -261,22 +264,26 @@ class ScheduleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs=super().get_queryset();user=self.request.user
         if user.role==User.Role.DOCTOR:qs=qs.filter(doctor__user=user)
+        elif user.role==User.Role.STAFF:qs=qs.filter(Q(doctor__department=user.department)|Q(doctor__departments=user.department)).distinct()
         elif user.role==User.Role.PATIENT:qs=qs.filter(is_active=True,date__gte=timezone.localdate(),doctor__is_available=True,doctor__user__is_active=True)
         return qs
     def perform_create(self,serializer):
         user=self.request.user
-        if user.role==User.Role.DOCTOR:obj=serializer.save(doctor=user.doctor_profile)
-        elif user.role==User.Role.ADMIN:obj=serializer.save()
-        else:raise PermissionDenied('无权创建排班。')
-        audit(self.request,'create','schedule',obj)
+        if not can_manage_schedule(user):raise PermissionDenied('仅科室排班岗可创建排班。')
+        doctor=serializer.validated_data.get('doctor')
+        if user.role==User.Role.STAFF and doctor and doctor.department_id!=user.department_id:raise PermissionDenied('只能为本院区本科室医师排班。')
+        obj=serializer.save();audit(self.request,'create','schedule',obj)
     def perform_update(self,serializer):
-        if self.request.user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('无权修改排班。')
+        user=self.request.user
+        if not can_manage_schedule(user):raise PermissionDenied('仅科室排班岗可修改排班。')
+        obj=self.get_object()
+        if user.role==User.Role.STAFF and obj.doctor.department_id!=user.department_id:raise PermissionDenied('只能修改本科室排班。')
         obj=serializer.save();audit(self.request,'update','schedule',obj)
     @action(detail=False,methods=['get'])
     def outpatient(self,request):
         """门诊就诊视图：医师 → 排班 → 号源 → 患者，支持日期区间、科室、医师与状态筛选。"""
         user=request.user
-        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('门诊就诊视图仅对管理员和医师开放。')
+        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR,User.Role.STAFF}:raise PermissionDenied('门诊就诊视图仅对管理员、医师和排班岗开放。')
         today=timezone.localdate();day=parse_date_query(request.query_params.get('date'),'date');start=parse_date_query(request.query_params.get('date_from'),'date_from');end=parse_date_query(request.query_params.get('date_to'),'date_to')
         if day:start=end=day
         if start is None:start=end=today
@@ -290,6 +297,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         if doctor_id:qs=qs.filter(doctor_id=doctor_id)
         if department_id:qs=qs.filter(Q(doctor__department_id=department_id)|Q(doctor__departments__id=department_id)).distinct()
         if user.role==User.Role.DOCTOR:qs=qs.filter(doctor__user=user)
+        elif user.role==User.Role.STAFF:qs=qs.filter(Q(doctor__department=user.department)|Q(doctor__departments=user.department)).distinct()
         qs=qs.order_by('date','doctor__doctor_no','start_time','pk')
         page,size=page_meta(request);total,schedules=page_slice(qs,page,size)
         status_labels={**{value:label for value,label in Appointment.Status.choices},AppointmentSlot.Status.AVAILABLE:'可预约',AppointmentSlot.Status.CLOSED:'已关闭'}
@@ -330,17 +338,34 @@ class AppointmentViewSet(viewsets.ModelViewSet):
     serializer_class=AppointmentSerializer;queryset=Appointment.objects.select_related('patient__user','doctor__user','doctor__department','slot__schedule');http_method_names=['get','post','head','options']
     search_fields=('appointment_no','patient__user__first_name','doctor__user__first_name','reason');ordering_fields=('created_at','slot__schedule__date','slot__start_time')
     def get_queryset(self):
-        user=self.request.user;qs=super().get_queryset();state=self.request.query_params.get('status')
+        user=self.request.user;qs=super().get_queryset();state=self.request.query_params.get('status');visit_type=self.request.query_params.get('visit_type')
         if user.role==User.Role.PATIENT:qs=qs.filter(patient__user=user)
         elif user.role==User.Role.DOCTOR:qs=qs.filter(doctor__user=user)
+        elif user.role==User.Role.NURSE:qs=qs.filter(visit_type=Appointment.VisitType.EMERGENCY)
+        elif user.role==User.Role.STAFF:qs=qs.filter(department=user.department) if user.department_id else qs.none()
         if state:qs=qs.filter(status=state)
+        if visit_type:qs=qs.filter(visit_type=visit_type)
         day=parse_date_query(self.request.query_params.get('date'),'date')
-        if day:qs=qs.filter(slot__schedule__date=day)
+        if day:qs=qs.filter(Q(slot__schedule__date=day)|Q(slot__isnull=True,arrived_at__date=day)|Q(slot__isnull=True,arrived_at__isnull=True,created_at__date=day))
         if self.request.query_params.get('without_record')=='true':qs=qs.filter(medical_record__isnull=True)
-        return qs
+        return qs.annotate(emergency_rank=Case(When(visit_type=Appointment.VisitType.EMERGENCY,then=0),default=1)).order_by('emergency_rank','triage_level','-created_at')
     def perform_create(self,serializer):
         if self.request.user.role!=User.Role.PATIENT:raise PermissionDenied('只有患者可以预约挂号。')
         obj=serializer.save();audit(self.request,'create','appointment',obj,'患者预约挂号')
+    @action(detail=False,methods=['post'])
+    @transaction.atomic
+    def emergency(self,request):
+        """急诊现场登记：无号源、必填分诊级别，由护士/事务员/管理员操作。"""
+        if not (is_nurse(request.user) or is_staff(request.user) or is_admin(request.user)):raise PermissionDenied('仅护士或科室事务员可登记急诊。')
+        patient=get_object_or_404(PatientProfile.objects.select_related('user'),pk=request.data.get('patient_id') or request.data.get('patient'))
+        doctor=get_object_or_404(DoctorProfile.objects.select_related('user','department'),pk=request.data.get('doctor_id') or request.data.get('doctor'))
+        triage=int_query(request.data.get('triage_level'),'triage_level',minimum=1,maximum=4)
+        reason=str(request.data.get('reason','')).strip() or '急诊就诊'
+        if not triage:raise APIValidationError({'triage_level':'请选择分诊级别（1-4）。'})
+        if request.user.role==User.Role.STAFF and request.user.department_id and doctor.department_id!=request.user.department_id:raise PermissionDenied('只能登记本科室急诊。')
+        appointment=Appointment.objects.create(patient=patient,doctor=doctor,department=doctor.department,slot=None,visit_type=Appointment.VisitType.EMERGENCY,source=Appointment.Source.EMERGENCY,triage_level=triage,arrived_at=timezone.now(),reason=reason,status=Appointment.Status.PENDING)
+        audit(request,'create','appointment',appointment,f'急诊登记 {appointment.appointment_no}')
+        return Response(self.get_serializer(appointment).data,status=201)
     def _transition(self,request,action_name):
         obj=transition_appointment(appointment=self.get_object(),user=request.user,action=action_name);audit(request,action_name,'appointment',obj);return Response(self.get_serializer(obj).data)
     @action(detail=True,methods=['post'])
@@ -356,15 +381,17 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         appointment=self.get_object();user=request.user
         if user.role==User.Role.PATIENT:raise PermissionDenied('诊疗工作区仅供医务人员使用。')
         if user.role==User.Role.DOCTOR and appointment.doctor.user_id!=user.id:raise PermissionDenied('只能访问本人负责的诊疗工作区。')
-        records=MedicalRecord.objects.filter(appointment__patient=appointment.patient).select_related('appointment__doctor__user','appointment__patient__user','appointment__doctor__department','appointment__department','appointment__slot__schedule').prefetch_related('corrections__author').order_by('-appointment__slot__schedule__date')
+        records=MedicalRecord.objects.filter(appointment__patient=appointment.patient).select_related('appointment__doctor__user','appointment__patient__user','appointment__doctor__department','appointment__department','appointment__slot__schedule').prefetch_related('corrections__author').order_by('-appointment__created_at')
         current=records.filter(appointment=appointment).first()
         # 工作区只展示该患者已确认的历史病历，避免通过接诊入口读取其他医师的草稿。
         history=records.filter(status=MedicalRecord.Status.CONFIRMED).exclude(appointment=appointment)
         prescriptions=Prescription.objects.filter(record__appointment=appointment).select_related('record__appointment__patient__user','doctor__user').prefetch_related('items__medicine')
         examinations=ExaminationOrder.objects.filter(record__appointment=appointment).select_related('patient__user','doctor__user','record','item').prefetch_related('files')
+        procedures=ProcedureOrder.objects.filter(record__appointment=appointment).select_related('patient__user','doctor__user','record','item')
         admissions=InpatientAdmission.objects.filter(patient=appointment.patient).select_related('patient__user','attending_doctor__user','department','appointment','bed')[:10]
+        templates=RecordTemplate.objects.filter(is_active=True).filter(Q(department=appointment.department)|Q(department__isnull=True)).select_related('department')[:30]
         audit(request,'read','visit_workspace',appointment,f'打开诊疗工作区 {appointment.appointment_no}')
-        return Response({'appointment':self.get_serializer(appointment).data,'patient':PatientSerializer(appointment.patient).data,'current_record':MedicalRecordSerializer(current,context={'request':request}).data if current else None,'history':MedicalRecordSerializer(history[:10],many=True,context={'request':request}).data,'history_count':history.count(),'prescriptions':PrescriptionSerializer(prescriptions,many=True,context={'request':request}).data,'examinations':ExaminationSerializer(examinations,many=True,context={'request':request}).data,'admissions':InpatientSerializer(admissions,many=True,context={'request':request}).data})
+        return Response({'appointment':self.get_serializer(appointment).data,'patient':PatientSerializer(appointment.patient).data,'current_record':MedicalRecordSerializer(current,context={'request':request}).data if current else None,'history':MedicalRecordSerializer(history[:10],many=True,context={'request':request}).data,'history_count':history.count(),'prescriptions':PrescriptionSerializer(prescriptions,many=True,context={'request':request}).data,'examinations':ExaminationSerializer(examinations,many=True,context={'request':request}).data,'procedures':ProcedureOrderSerializer(procedures,many=True,context={'request':request}).data,'admissions':InpatientSerializer(admissions,many=True,context={'request':request}).data,'templates':RecordTemplateSerializer(templates,many=True,context={'request':request}).data})
 
 class MedicalRecordViewSet(viewsets.ModelViewSet):
     serializer_class=MedicalRecordSerializer;queryset=MedicalRecord.objects.select_related('appointment__patient__user','appointment__doctor__user','appointment__slot__schedule').prefetch_related('corrections__author');http_method_names=['get','post','patch','head','options']
@@ -417,6 +444,7 @@ class MedicineViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs=super().get_queryset();search=self.request.query_params.get('search','').strip()
         if self.request.query_params.get('available')=='true':qs=qs.filter(is_active=True,stock__gt=0)
+        if self.request.query_params.get('active')=='true':qs=qs.filter(is_active=True)
         if search:qs=qs.filter(Q(name__icontains=search)|Q(specification__icontains=search))
         return qs
     def perform_create(self,serializer):
@@ -457,7 +485,7 @@ class WardBedViewSet(viewsets.ModelViewSet):
     search_fields=('ward_name','bed_no','department__name');ordering_fields=('ward_name','bed_no','daily_rate')
     def get_queryset(self):
         user=self.request.user
-        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('仅管理员和医师可以查看床位看板。')
+        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR,User.Role.STAFF,User.Role.NURSE}:raise PermissionDenied('仅医务人员可以查看床位看板。')
         qs=super().get_queryset();department=self.request.query_params.get('department');available=self.request.query_params.get('available');active=self.request.query_params.get('active');ward=self.request.query_params.get('ward');occupancy=self.request.query_params.get('occupancy')
         if department:qs=qs.filter(department_id=department)
         if ward:qs=qs.filter(ward_name=ward)
@@ -486,7 +514,7 @@ class WardBedViewSet(viewsets.ModelViewSet):
     def board(self,request):
         """看板专用接口：一次返回筛选范围内按病区分组的床位、完整选项与准确状态统计，不受分页影响。"""
         user=request.user
-        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('仅管理员和医师可以查看床位看板。')
+        if user.role not in {User.Role.ADMIN,User.Role.DOCTOR,User.Role.STAFF,User.Role.NURSE}:raise PermissionDenied('仅医务人员可以查看床位看板。')
         department=self._int_param('department');ward=self.request.query_params.get('ward','').strip() or None
         occupancy=request.query_params.get('occupancy','');active=request.query_params.get('active','')
         filtered=WardBed.objects.select_related('department')
@@ -560,10 +588,14 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
         user=self.request.user;qs=super().get_queryset()
         if user.role==User.Role.DOCTOR:qs=qs.filter(Q(doctor__user=user)|Q(record__appointment__patient__appointments__doctor__user=user,record__appointment__patient__appointments__status__in=VALID_RELATIONSHIP_STATUSES)).distinct()
         elif user.role==User.Role.PATIENT:qs=qs.filter(record__appointment__patient__user=user)
+        elif user.role==User.Role.STAFF and user.station==User.Station.PHARMACY:qs=qs.all()
+        elif user.role==User.Role.NURSE:qs=qs.none()
+        else:qs=qs.none() if user.role==User.Role.STAFF else qs
         patient=self.request.query_params.get('patient')
         if patient:qs=qs.filter(record__appointment__patient_id=patient)
         state=self.request.query_params.get('status')
         if state:qs=qs.filter(status=state)
+        if self.request.query_params.get('payment_status')=='paid':qs=qs.filter(billing_record__status=BillingRecord.Status.PAID)
         return qs
     def perform_create(self,serializer):
         if self.request.user.role!=User.Role.DOCTOR:raise PermissionDenied('仅医师可开具处方。')
@@ -580,6 +612,28 @@ class PrescriptionViewSet(viewsets.ModelViewSet):
             if bill.status==BillingRecord.Status.UNPAID:bill.status=BillingRecord.Status.CANCELLED;bill.save(update_fields=['status','updated_at'])
         except BillingRecord.DoesNotExist:pass
         audit(request,'cancel','prescription',obj);return Response(self.get_serializer(obj).data)
+    @action(detail=True,methods=['post'])
+    @transaction.atomic
+    def dispense(self,request,pk=None):
+        if not can_dispense(request.user):raise PermissionDenied('仅药房或管理员可确认发药。')
+        prescription=Prescription.objects.select_for_update().select_related('billing_record').get(pk=self.get_object().pk)
+        if prescription.status!=Prescription.Status.ISSUED:raise APIValidationError('当前处方不可发药。')
+        try:bill=prescription.billing_record
+        except BillingRecord.DoesNotExist:raise APIValidationError('处方尚未生成费用账单。')
+        if bill.status!=BillingRecord.Status.PAID:raise APIValidationError('处方尚未缴费，不能发药。')
+        items=list(PrescriptionItem.objects.filter(prescription=prescription).select_related('medicine'))
+        medicines={item.pk:item for item in Medicine.objects.select_for_update().filter(pk__in=[line.medicine_id for line in items])}
+        shortages=[]
+        for line in items:
+            medicine=medicines[line.medicine_id]
+            if not medicine.is_active or medicine.stock<line.quantity:shortages.append(f'{medicine.name}（库存 {medicine.stock}，需要 {line.quantity}）')
+        if shortages:raise APIValidationError({'stock':'库存不足：'+'；'.join(shortages)})
+        for line in items:
+            medicine=medicines[line.medicine_id];medicine.stock-=line.quantity;medicine.save(update_fields=['stock','updated_at']);record_stock_movement(medicine=medicine,quantity=-line.quantity,movement_type=MedicineStockMovement.Type.DISPENSE,operator=request.user,prescription=prescription,note='药房确认发药')
+        prescription.status=Prescription.Status.DISPENSED;prescription.dispensed_at=timezone.now();prescription.dispensed_by=request.user;prescription.execution_department=request.user.department
+        prescription.save(update_fields=['status','dispensed_at','dispensed_by','execution_department','updated_at'])
+        audit(request,'dispense','prescription',prescription,'药房确认发药并扣减库存')
+        return Response(self.get_serializer(prescription).data)
 
 class ExaminationViewSet(viewsets.ModelViewSet):
     serializer_class=ExaminationSerializer;queryset=ExaminationOrder.objects.select_related('patient__user','doctor__user','record','billing_record__inpatient_admission').prefetch_related('files');http_method_names=['get','post','head','options']
@@ -589,10 +643,13 @@ class ExaminationViewSet(viewsets.ModelViewSet):
         user=self.request.user;qs=super().get_queryset()
         if user.role==User.Role.PATIENT:qs=qs.filter(patient__user=user,status=ExaminationOrder.Status.PUBLISHED)
         elif user.role==User.Role.DOCTOR:qs=qs.filter(Q(doctor__user=user)|Q(patient__appointments__doctor__user=user,patient__appointments__status__in=VALID_RELATIONSHIP_STATUSES)).distinct()
+        elif user.role==User.Role.STAFF and user.station==User.Station.EXECUTION:qs=qs.all()
+        elif user.role not in {User.Role.ADMIN}:qs=qs.none()
         patient=self.request.query_params.get('patient')
         if patient:qs=qs.filter(patient_id=patient)
         state=self.request.query_params.get('status')
         if state:qs=qs.filter(status=state)
+        if self.request.query_params.get('payment_status')=='paid':qs=qs.filter(billing_record__status=BillingRecord.Status.PAID)
         order_type=self.request.query_params.get('type')
         if order_type:qs=qs.filter(type=order_type)
         report_state=self.request.query_params.get('report_status')
@@ -626,9 +683,14 @@ class ExaminationViewSet(viewsets.ModelViewSet):
         raise PermissionDenied('仅医师或管理员可处理检查报告。')
     @action(detail=True,methods=['post'])
     def start(self,request,pk=None):
-        order=self.get_object();self.ensure_report_manager(request,order)
+        order=self.get_object()
+        if not (request.user.role in {User.Role.ADMIN,User.Role.DOCTOR} or can_execute(request.user)):raise PermissionDenied('无权开始检查。')
         if order.status!=ExaminationOrder.Status.REQUESTED:raise APIValidationError('仅已申请的检查可以开始处理。')
-        order.status=ExaminationOrder.Status.IN_PROGRESS;order.save(update_fields=['status','updated_at']);audit(request,'start','examination',order,'开始处理检查申请')
+        try:bill=order.billing_record
+        except BillingRecord.DoesNotExist:bill=None
+        if bill is not None and bill.status!=BillingRecord.Status.PAID:raise APIValidationError('检查尚未缴费，不能开始执行。')
+        order.status=ExaminationOrder.Status.IN_PROGRESS;order.started_by=request.user;order.started_at=timezone.now();order.execution_department=request.user.department
+        order.save(update_fields=['status','started_by','started_at','execution_department','updated_at']);audit(request,'start','examination',order,'开始处理检查申请')
         return Response(self.get_serializer(order).data)
     @action(detail=True,methods=['post'])
     @transaction.atomic
@@ -671,13 +733,102 @@ def medical_file_download(request,pk):
     except (FileNotFoundError,OSError):raise Http404('文件不存在。')
     audit(request,'download','medical_file',item,'下载医疗文件');return FileResponse(handle,content_type=mimetypes.guess_type(item.original_name)[0] or 'application/octet-stream',as_attachment=True,filename=item.original_name)
 
+@api_view(['POST'])
+def report_share_create(request,pk):
+    report=get_object_or_404(ExaminationReport.objects.select_related('order__patient__user','order__doctor__user','order__record__appointment__department'),pk=pk)
+    user=request.user;order=report.order
+    allowed=user.role==User.Role.ADMIN or (user.role==User.Role.DOCTOR and (order.doctor.user_id==user.id or has_doctor_patient_relationship(user=user,patient_id=order.patient_id))) or (user.role==User.Role.PATIENT and order.patient.user_id==user.id and report.status==ExaminationReport.Status.PUBLISHED)
+    if not allowed:raise PermissionDenied('无权分享该报告。')
+    if report.status!=ExaminationReport.Status.PUBLISHED:raise APIValidationError('报告发布后才能生成分享二维码。')
+    token=secrets.token_urlsafe(32)
+    share=ReportShareToken.objects.create(report=report,token=token,expires_at=timezone.now()+timedelta(days=7),created_by=user)
+    audit(request,'share','examination_report',report,'生成报告分享二维码')
+    return Response({'token':share.token,'expires_at':share.expires_at,'url':request.build_absolute_uri(f'/app/share/report/{share.token}')},status=201)
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def shared_report(request,token):
+    share=get_object_or_404(ReportShareToken.objects.select_related('report__order__patient__user','report__order__doctor__user','report__order__record__appointment__department','report__order__item'),token=token)
+    if not share.is_valid:raise PermissionDenied('分享链接已失效。')
+    ReportShareToken.objects.filter(pk=share.pk).update(access_count=F('access_count')+1)
+    report=share.report;order=report.order;department=order.record.appointment.department or order.doctor.department
+    files=[{'id':file.pk,'original_name':file.original_name,'file_type':file.file_type,'size':file.size,'download_url':request.build_absolute_uri(f'/api/v1/share/reports/{token}/files/{file.pk}/')} for file in order.files.all()]
+    return Response({'token':token,'expires_at':share.expires_at,'report':{'findings':report.findings,'conclusion':report.conclusion,'published_at':report.published_at},'order':{'order_no':order.order_no,'item_name':order.item_name_snapshot,'type_display':order.get_type_display(),'patient_name':order.patient.user.get_full_name(),'patient_no':order.patient.patient_no,'doctor_name':order.doctor.user.get_full_name(),'department_name':department.name if department else None,'created_at':order.created_at},'files':files,'notice':'演示数据，链接 7 天内有效，请勿用于真实诊疗。'})
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def shared_report_file(request,token,file_id):
+    share=get_object_or_404(ReportShareToken.objects.select_related('report__order'),token=token)
+    if not share.is_valid:raise PermissionDenied('分享链接已失效。')
+    item=get_object_or_404(MedicalFile,order=share.report.order,pk=file_id)
+    try:handle=item.file.open('rb')
+    except (FileNotFoundError,OSError):raise Http404('文件不存在。')
+    return FileResponse(handle,content_type=mimetypes.guess_type(item.original_name)[0] or 'application/octet-stream',as_attachment=False,filename=item.original_name)
+
+class ProcedureItemViewSet(viewsets.ModelViewSet):
+    permission_classes=[IsAdminOrReadOnly];serializer_class=ProcedureItemSerializer;queryset=ProcedureItem.objects.select_related('execution_department').all();http_method_names=['get','post','patch','head','options']
+    search_fields=('name','description');ordering_fields=('name','category','price')
+    def get_queryset(self):
+        qs=super().get_queryset();active=self.request.query_params.get('active')
+        if active in {'true','1'}:qs=qs.filter(is_active=True)
+        return qs
+    def perform_create(self,serializer):obj=serializer.save();audit(self.request,'create','procedure_item',obj,'创建处置项目')
+    def perform_update(self,serializer):obj=serializer.save();audit(self.request,'update','procedure_item',obj,'更新处置项目')
+
+class ProcedureViewSet(viewsets.ModelViewSet):
+    serializer_class=ProcedureOrderSerializer;queryset=ProcedureOrder.objects.select_related('patient__user','doctor__user','record','item','billing_record').all();http_method_names=['get','post','head','options']
+    search_fields=('order_no','patient__user__first_name','item_name_snapshot','clinical_note');ordering_fields=('created_at',)
+    def get_queryset(self):
+        user=self.request.user;qs=super().get_queryset()
+        if user.role==User.Role.PATIENT:qs=qs.filter(patient__user=user)
+        elif user.role==User.Role.DOCTOR:qs=qs.filter(Q(doctor__user=user)|Q(patient__appointments__doctor__user=user,patient__appointments__status__in=VALID_RELATIONSHIP_STATUSES)).distinct()
+        elif user.role==User.Role.STAFF and user.station==User.Station.EXECUTION:qs=qs.all()
+        elif user.role!=User.Role.ADMIN:qs=qs.none()
+        state=self.request.query_params.get('status');patient=self.request.query_params.get('patient')
+        if state:qs=qs.filter(status=state)
+        if patient:qs=qs.filter(patient_id=patient)
+        if self.request.query_params.get('payment_status')=='paid':qs=qs.filter(billing_record__status=BillingRecord.Status.PAID)
+        return qs
+    def perform_create(self,serializer):
+        if self.request.user.role!=User.Role.DOCTOR:raise PermissionDenied('仅医师可开具处置。')
+        obj=serializer.save();audit(self.request,'create','procedure',obj,'开具处置')
+    def _execution(self,request,target):
+        if not (can_execute(request.user) or request.user.role==User.Role.ADMIN):raise PermissionDenied('仅执行科室或护士可确认处置。')
+        order=self.get_object()
+        if order.status not in {ProcedureOrder.Status.REQUESTED,ProcedureOrder.Status.IN_PROGRESS}:raise APIValidationError('当前处置不可执行。')
+        try:bill=order.billing_record
+        except BillingRecord.DoesNotExist:bill=None
+        if bill is not None and bill.status!=BillingRecord.Status.PAID:raise APIValidationError('处置尚未缴费，不能执行。')
+        order.status=target;order.executed_by=request.user;order.executed_at=timezone.now();order.execution_department=request.user.department
+        order.save(update_fields=['status','executed_by','executed_at','execution_department','updated_at'])
+        audit(request,target,'procedure',order,f'处置状态更新为{order.get_status_display()}')
+        return Response(self.get_serializer(order).data)
+    @action(detail=True,methods=['post'])
+    def start(self,request,pk=None):return self._execution(request,ProcedureOrder.Status.IN_PROGRESS)
+    @action(detail=True,methods=['post'])
+    def complete(self,request,pk=None):return self._execution(request,ProcedureOrder.Status.COMPLETED)
+    @action(detail=True,methods=['post'])
+    def cancel(self,request,pk=None):
+        order=self.get_object()
+        if request.user.role!=User.Role.DOCTOR or order.doctor.user_id!=request.user.id:raise PermissionDenied('只能取消本人开具的处置。')
+        if order.status not in {ProcedureOrder.Status.REQUESTED}:raise APIValidationError('仅待执行的处置可以取消。')
+        order.status=ProcedureOrder.Status.CANCELLED;order.save(update_fields=['status','updated_at'])
+        try:
+            bill=order.billing_record
+            if bill.status==BillingRecord.Status.UNPAID:bill.status=BillingRecord.Status.CANCELLED;bill.save(update_fields=['status','updated_at'])
+        except BillingRecord.DoesNotExist:pass
+        audit(request,'cancel','procedure',order,'取消处置')
+        return Response(self.get_serializer(order).data)
+
 class BillingViewSet(viewsets.ModelViewSet):
-    serializer_class=BillingSerializer;queryset=BillingRecord.objects.select_related('patient__user','appointment__doctor__user','prescription','examination','inpatient_admission__department');http_method_names=['get','post','patch','head','options']
+    serializer_class=BillingSerializer;queryset=BillingRecord.objects.select_related('patient__user','appointment__doctor__user','prescription','examination','procedure','refund','inpatient_admission__department');http_method_names=['get','post','patch','head','options']
     search_fields=('bill_no','patient__user__first_name','description');ordering_fields=('created_at','amount')
     def get_queryset(self):
         user=self.request.user;qs=super().get_queryset();state=self.request.query_params.get('status');admission=self.request.query_params.get('admission')
         if user.role==User.Role.PATIENT:qs=qs.filter(patient__user=user)
         elif user.role==User.Role.DOCTOR:qs=qs.filter(Q(patient__admissions__attending_doctor__user=user)|Q(appointment__doctor__user=user)).distinct()
+        elif user.role==User.Role.STAFF:qs=qs.all() if user.station==User.Station.CASHIER else qs.none()
+        elif user.role==User.Role.NURSE:qs=qs.none()
         if state:qs=qs.filter(status=state)
         if admission:qs=qs.filter(inpatient_admission_id=admission)
         return qs
@@ -698,7 +849,7 @@ class BillingViewSet(viewsets.ModelViewSet):
         if start>end:raise APIValidationError({'date_to':'结束日期不能早于开始日期。'})
         if (end-start).days>366:raise APIValidationError({'date_to':'查询区间不能超过 367 天。'})
         base=BillingRecord.objects.select_related('examination','patient__user').filter(patient=patient,category=BillingRecord.Category.EXAMINATION,examination__isnull=False,created_at__date__range=(start,end))
-        active=base.exclude(status=BillingRecord.Status.CANCELLED)
+        active=base.exclude(status__in=[BillingRecord.Status.CANCELLED,BillingRecord.Status.REFUNDED])
         totals=active.aggregate(billed=Sum('amount'))
         paid=active.filter(status=BillingRecord.Status.PAID).aggregate(value=Sum('amount'))['value'] or Decimal('0')
         unpaid=active.filter(status=BillingRecord.Status.UNPAID).aggregate(value=Sum('amount'))['value'] or Decimal('0')
@@ -739,7 +890,7 @@ class BillingViewSet(viewsets.ModelViewSet):
         if start>end:raise APIValidationError({'date_to':'结束日期不能早于开始日期。'})
         if (end-start).days>366:raise APIValidationError({'date_to':'查询区间不能超过 367 天。'})
         base=BillingRecord.objects.select_related('prescription','patient__user').prefetch_related('prescription__items__medicine').filter(patient=patient,category=BillingRecord.Category.MEDICINE,created_at__date__range=(start,end))
-        active=base.exclude(status=BillingRecord.Status.CANCELLED)
+        active=base.exclude(status__in=[BillingRecord.Status.CANCELLED,BillingRecord.Status.REFUNDED])
         totals=active.aggregate(billed=Sum('amount'))
         paid=active.filter(status=BillingRecord.Status.PAID).aggregate(value=Sum('amount'))['value'] or Decimal('0')
         unpaid=active.filter(status=BillingRecord.Status.UNPAID).aggregate(value=Sum('amount'))['value'] or Decimal('0')
@@ -788,28 +939,35 @@ class BillingViewSet(viewsets.ModelViewSet):
         bill=BillingRecord.objects.select_for_update().select_related('patient__user','prescription').get(pk=self.get_object().pk)
         if bill.status!=BillingRecord.Status.UNPAID:raise APIValidationError('当前账单不可缴费。')
         if request.user.role==User.Role.PATIENT and bill.patient.user_id!=request.user.id:raise PermissionDenied('只能支付本人的账单。')
-        if request.user.role not in {User.Role.ADMIN,User.Role.PATIENT}:raise PermissionDenied('无权执行缴费。')
-        if bill.prescription_id:
-            prescription=Prescription.objects.select_for_update().get(pk=bill.prescription_id)
-            if prescription.status!=Prescription.Status.ISSUED:raise APIValidationError('关联处方当前不可发药。')
-            items=list(PrescriptionItem.objects.filter(prescription=prescription).select_related('medicine'))
-            medicines={item.pk:item for item in Medicine.objects.select_for_update().filter(pk__in=[line.medicine_id for line in items])}
-            shortages=[]
-            for line in items:
-                medicine=medicines[line.medicine_id]
-                if not medicine.is_active or medicine.stock<line.quantity:shortages.append(f'{medicine.name}（库存 {medicine.stock}，需要 {line.quantity}）')
-            if shortages:raise APIValidationError({'stock':'库存不足：'+'；'.join(shortages)})
-            for line in items:
-                medicine=medicines[line.medicine_id];medicine.stock-=line.quantity;medicine.save(update_fields=['stock','updated_at']);record_stock_movement(medicine=medicine,quantity=-line.quantity,movement_type=MedicineStockMovement.Type.DISPENSE,operator=request.user,prescription=prescription,note='支付后自动发药')
-            prescription.status=Prescription.Status.DISPENSED;prescription.dispensed_at=timezone.now();prescription.save(update_fields=['status','dispensed_at','updated_at']);audit(request,'dispense','prescription',prescription,'支付完成并自动发药')
+        if request.user.role not in {User.Role.ADMIN,User.Role.PATIENT} and not (is_staff(request.user,User.Station.CASHIER)):raise PermissionDenied('无权执行缴费。')
         bill.status=BillingRecord.Status.PAID;bill.payment_method=str(request.data.get('payment_method','演示支付'))[:30];bill.paid_at=timezone.now();bill.save(update_fields=['status','payment_method','paid_at','updated_at']);audit(request,'pay','billing',bill,'完成费用结算')
         return Response(self.get_serializer(bill).data)
     @action(detail=True,methods=['post'])
     def cancel(self,request,pk=None):
-        if request.user.role!=User.Role.ADMIN:raise PermissionDenied('仅管理员可取消账单。')
+        if not (is_admin(request.user) or can_refund(request.user)):raise PermissionDenied('仅收费岗或管理员可取消账单。')
         bill=self.get_object()
         if bill.status!=BillingRecord.Status.UNPAID:raise APIValidationError('仅待缴费账单可以取消。')
         bill.status=BillingRecord.Status.CANCELLED;bill.save(update_fields=['status','updated_at']);audit(request,'cancel','billing',bill,'取消费用账单');return Response(self.get_serializer(bill).data)
+    @action(detail=True,methods=['post'])
+    @transaction.atomic
+    def refund(self,request,pk=None):
+        if not can_refund(request.user):raise PermissionDenied('仅收费岗可办理退费。')
+        bill=BillingRecord.objects.select_for_update().select_related('prescription','examination','procedure').get(pk=self.get_object().pk)
+        if bill.status!=BillingRecord.Status.PAID:raise APIValidationError('仅已缴费账单可以退费。')
+        if bill.prescription_id and bill.prescription.status==Prescription.Status.DISPENSED:raise APIValidationError('处方已发药，不能直接退费。')
+        if bill.examination_id and bill.examination.status not in {ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.CANCELLED}:raise APIValidationError('检查已执行，不能直接退费。')
+        if bill.procedure_id and bill.procedure.status not in {ProcedureOrder.Status.REQUESTED,ProcedureOrder.Status.CANCELLED}:raise APIValidationError('处置已执行，不能直接退费。')
+        reason=str(request.data.get('reason','')).strip() or '门诊退费'
+        refund=RefundRecord.objects.create(bill=bill,amount=bill.amount,reason=reason[:200],operator=request.user,refunded_at=timezone.now())
+        bill.status=BillingRecord.Status.REFUNDED;bill.save(update_fields=['status','updated_at'])
+        if bill.prescription_id:
+            Prescription.objects.filter(pk=bill.prescription_id).update(status=Prescription.Status.CANCELLED)
+        if bill.examination_id:
+            ExaminationOrder.objects.filter(pk=bill.examination_id).update(status=ExaminationOrder.Status.CANCELLED)
+        if bill.procedure_id:
+            ProcedureOrder.objects.filter(pk=bill.procedure_id).update(status=ProcedureOrder.Status.CANCELLED)
+        audit(request,'refund','billing',bill,f'退费 {refund.refund_no}：{reason}')
+        return Response({'bill':self.get_serializer(bill).data,'refund':RefundSerializer(refund).data})
 
 def admission_charge_payload(admission,date_from=None,date_to=None):
     """住院费用清单：逐项费用与真实明细行、费用合计、已付/待付与住院中预计床位费。取消的账单单独列出且不计入合计。"""
@@ -834,7 +992,7 @@ def admission_charge_payload(admission,date_from=None,date_to=None):
         row['details_total']=str(details_total.quantize(Decimal('0.01')))
         row['details_consistent']=bool(details) and details_total==Decimal(row['amount'])
         items.append(row)
-    billable=[row for row in items if row['status']!=BillingRecord.Status.CANCELLED]
+    billable=[row for row in items if row['status'] not in {BillingRecord.Status.CANCELLED,BillingRecord.Status.REFUNDED}]
     def money(value):return str(Decimal(value).quantize(Decimal('0.01')))
     totals={}
     for row in billable:totals[row['category']]=totals.get(row['category'],Decimal('0'))+Decimal(row['amount'])
@@ -849,11 +1007,14 @@ def admission_charge_payload(admission,date_from=None,date_to=None):
     return {'admission':InpatientChargeSummarySerializer(admission,context={'charge_totals':totals}).data,'items':items,'summary':summary,'bed_fee_rule':'住院中床位费按本地日期逐日预估（至少一天），出院时固定为唯一床位费账单；费用发生日期为账单创建日期。'}
 
 class InpatientViewSet(viewsets.ModelViewSet):
-    serializer_class=InpatientSerializer;queryset=InpatientAdmission.objects.select_related('patient__user','attending_doctor__user','department','appointment','bed');http_method_names=['get','post','patch','head','options']
+    serializer_class=InpatientSerializer;queryset=InpatientAdmission.objects.select_related('patient__user','attending_doctor__user','department','appointment','bed');http_method_names=['get','post','put','patch','head','options']
     search_fields=('admission_no','patient__user__first_name','ward','bed_no','admission_diagnosis');ordering_fields=('created_at','admitted_at','discharged_at')
     def get_queryset(self):
         user=self.request.user;qs=super().get_queryset();state=self.request.query_params.get('status');department=self.request.query_params.get('department');bed=self.request.query_params.get('bed');patient=self.request.query_params.get('patient')
         if user.role==User.Role.PATIENT:qs=qs.filter(patient__user=user)
+        elif user.role==User.Role.DOCTOR:qs=qs.filter(Q(attending_doctor__user=user)|Q(department__doctors__user=user)).distinct()
+        elif user.role==User.Role.NURSE:qs=qs.filter(department=user.department)
+        elif user.role==User.Role.STAFF and user.station==User.Station.ADMISSION:qs=qs.all()
         if state:qs=qs.filter(status=state)
         if department:qs=qs.filter(department_id=department)
         if bed:qs=qs.filter(bed_id=bed)
@@ -875,21 +1036,101 @@ class InpatientViewSet(viewsets.ModelViewSet):
         payload=admission_charge_payload(admission,date_from=request.query_params.get('date_from'),date_to=request.query_params.get('date_to'))
         payload['role']=request.user.role
         return Response(payload)
+    @action(detail=True,methods=['get','put','patch'])
+    def record(self,request,pk=None):
+        admission=self.get_object()
+        if request.method=='GET':
+            try:obj=admission.inpatient_record
+            except InpatientRecord.DoesNotExist:obj=None
+            return Response({'record':InpatientRecordSerializer(obj).data if obj else None})
+        if request.user.role not in {User.Role.DOCTOR,User.Role.ADMIN}:raise PermissionDenied('仅医师可书写住院病志。')
+        if admission.status in {InpatientAdmission.Status.DISCHARGED,InpatientAdmission.Status.CANCELLED}:raise APIValidationError('已结束的住院不可修改病志。')
+        obj,_=InpatientRecord.objects.get_or_create(admission=admission,defaults={'created_by':request.user})
+        for key in ('chief_complaint','present_illness','past_history','physical_exam','diagnosis','course','discharge_summary'):
+            if key in request.data:setattr(obj,key,str(request.data.get(key,'') or ''))
+        obj.updated_by=request.user;obj.save();audit(request,'update','inpatient_record',obj,'保存住院病志')
+        return Response({'record':InpatientRecordSerializer(obj).data})
+    @action(detail=True,methods=['get','post'])
+    def orders(self,request,pk=None):
+        admission=self.get_object();user=request.user
+        if request.method=='GET':
+            qs=admission.orders.select_related('prescriber','executor')
+            order_type=request.query_params.get('order_type')
+            if order_type:qs=qs.filter(order_type=order_type)
+            return Response({'count':qs.count(),'results':InpatientOrderSerializer(qs,many=True).data})
+        if user.role not in {User.Role.DOCTOR,User.Role.ADMIN}:raise PermissionDenied('仅医师可开具住院医嘱。')
+        order_type=str(request.data.get('order_type','temp'));content=str(request.data.get('content','')).strip()
+        if order_type not in dict(InpatientOrder.OrderType.choices) or not content:raise APIValidationError({'content':'请选择医嘱类型并填写内容。'})
+        obj=InpatientOrder.objects.create(admission=admission,order_type=order_type,category=str(request.data.get('category','other')),content=content,dosage=str(request.data.get('dosage','')),frequency=str(request.data.get('frequency','')),start_at=request.data.get('start_at') or None,stop_at=request.data.get('stop_at') or None,prescriber=user,status=InpatientOrder.Status.SUBMITTED)
+        audit(request,'create','inpatient_order',obj,'开具住院医嘱')
+        return Response(InpatientOrderSerializer(obj).data,status=201)
+    @action(detail=True,methods=['post'],url_path=r'orders/(?P<order_id>\d+)/execute')
+    def execute_order(self,request,pk=None,order_id=None):
+        if not (is_nurse(request.user) or is_admin(request.user)):raise PermissionDenied('仅护士可执行住院医嘱。')
+        admission=self.get_object();obj=get_object_or_404(InpatientOrder,admission=admission,pk=order_id)
+        if obj.status not in {InpatientOrder.Status.SUBMITTED,InpatientOrder.Status.EXECUTING}:raise APIValidationError('当前医嘱不可执行。')
+        obj.status=InpatientOrder.Status.COMPLETED;obj.executor=request.user;obj.executed_at=timezone.now();obj.execution_note=str(request.data.get('execution_note',''))[:300];obj.save(update_fields=['status','executor','executed_at','execution_note','updated_at'])
+        audit(request,'execute','inpatient_order',obj,'执行住院医嘱')
+        return Response(InpatientOrderSerializer(obj).data)
+    @action(detail=True,methods=['post'],url_path=r'orders/(?P<order_id>\d+)/stop')
+    def stop_order(self,request,pk=None,order_id=None):
+        if request.user.role not in {User.Role.DOCTOR,User.Role.ADMIN}:raise PermissionDenied('仅医师可停止长期医嘱。')
+        admission=self.get_object();obj=get_object_or_404(InpatientOrder,admission=admission,pk=order_id,order_type=InpatientOrder.OrderType.LONG)
+        obj.status=InpatientOrder.Status.STOPPED;obj.stop_at=timezone.now();obj.save(update_fields=['status','stop_at','updated_at'])
+        audit(request,'stop','inpatient_order',obj,'停止长期医嘱')
+        return Response(InpatientOrderSerializer(obj).data)
+    @action(detail=True,methods=['post'])
+    def receive(self,request,pk=None):
+        if not (is_nurse(request.user) or is_admin(request.user)):raise PermissionDenied('仅护士可接诊住院患者。')
+        admission=self.get_object()
+        if admission.status!=InpatientAdmission.Status.ADMITTED:raise APIValidationError('仅已入院患者可以接诊。')
+        admission.received_at=timezone.now();admission.receiving_nurse=request.user;admission.save(update_fields=['received_at','receiving_nurse','updated_at'])
+        audit(request,'receive','inpatient',admission,'护士接诊住院患者')
+        return Response(self.get_serializer(admission).data)
+    @action(detail=True,methods=['post'],url_path='assign-bed')
+    def assign_bed(self,request,pk=None):
+        if not (is_admin(request.user) or can_admit(request.user)):raise PermissionDenied('仅住院处可分配床位。')
+        admission=self.get_object()
+        if admission.status!=InpatientAdmission.Status.PENDING:raise APIValidationError('仅待入院记录可以分配床位。')
+        bed_id=request.data.get('bed_id') or request.data.get('bed')
+        bed=get_object_or_404(WardBed.objects.select_related('department'),pk=bed_id)
+        if bed.department_id!=admission.department_id:raise APIValidationError({'bed_id':'床位与入院科室不匹配。'})
+        if bed.is_occupied:raise APIValidationError({'bed_id':'该床位已被占用。'})
+        admission.bed=bed;admission.ward=bed.ward_name;admission.bed_no=bed.bed_no;admission.daily_rate_snapshot=bed.daily_rate;admission.admission_staff=request.user
+        admission.save(update_fields=['bed','ward','bed_no','daily_rate_snapshot','admission_staff','updated_at'])
+        audit(request,'assign_bed','inpatient',admission,'住院处分配床位')
+        return Response(self.get_serializer(admission).data)
     @action(detail=True,methods=['post'])
     def admit(self,request,pk=None):
-        if request.user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('无权办理入院。')
+        if not (is_admin(request.user) or can_admit(request.user) or request.user.role==User.Role.DOCTOR):raise PermissionDenied('无权办理入院。')
         admission=self.get_object();ensure_admission_operator(admission=admission,user=request.user)
-        obj=admit_patient(admission=admission);audit(request,'admit','inpatient',obj,'办理入院');return Response(self.get_serializer(obj).data)
+        obj=admit_patient(admission=admission);obj.admission_staff=request.user if can_admit(request.user) else None;obj.save(update_fields=['admission_staff','updated_at'])
+        audit(request,'admit','inpatient',obj,'办理入院');return Response(self.get_serializer(obj).data)
     @action(detail=True,methods=['post'])
     def discharge(self,request,pk=None):
-        if request.user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('无权办理出院。')
+        if not (is_admin(request.user) or can_admit(request.user) or request.user.role==User.Role.DOCTOR):raise PermissionDenied('无权办理出院。')
         admission=self.get_object();ensure_admission_operator(admission=admission,user=request.user)
         obj=finish_admission(admission=admission,summary=str(request.data.get('discharge_summary','')));audit(request,'discharge','inpatient',obj,'办理出院并生成费用');return Response(self.get_serializer(obj).data)
     @action(detail=True,methods=['post'])
     def cancel(self,request,pk=None):
-        if request.user.role not in {User.Role.ADMIN,User.Role.DOCTOR}:raise PermissionDenied('无权取消住院。')
+        if not (is_admin(request.user) or can_admit(request.user) or request.user.role==User.Role.DOCTOR):raise PermissionDenied('无权取消住院。')
         admission=self.get_object();ensure_admission_operator(admission=admission,user=request.user)
         obj=finish_admission(admission=admission,cancel=True);audit(request,'cancel','inpatient',obj,'取消住院并释放床位');return Response(self.get_serializer(obj).data)
+
+class RecordTemplateViewSet(viewsets.ModelViewSet):
+    permission_classes=[IsAdminOrReadOnly];serializer_class=RecordTemplateSerializer;queryset=RecordTemplate.objects.select_related('department').all();http_method_names=['get','post','patch','head','options']
+    search_fields=('name','diagnosis');ordering_fields=('name','created_at')
+    def get_queryset(self):
+        qs=super().get_queryset();active=self.request.query_params.get('active');department=self.request.query_params.get('department')
+        if active in {'true','1'}:qs=qs.filter(is_active=True)
+        if department:qs=qs.filter(Q(department_id=department)|Q(department__isnull=True))
+        return qs
+    def perform_create(self,serializer):
+        if not is_admin(self.request.user):raise PermissionDenied('仅管理员可维护病历模板。')
+        obj=serializer.save(created_by=self.request.user);audit(self.request,'create','record_template',obj,'创建病历模板')
+    def perform_update(self,serializer):
+        if not is_admin(self.request.user):raise PermissionDenied('仅管理员可维护病历模板。')
+        obj=serializer.save();audit(self.request,'update','record_template',obj,'更新病历模板')
 
 class AuditViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes=[IsAdmin];serializer_class=AuditSerializer;queryset=AuditLog.objects.select_related('user')
@@ -906,6 +1147,7 @@ class AuditViewSet(viewsets.ReadOnlyModelViewSet):
 @api_view(['GET'])
 def statistics_overview(request):
     user=request.user;today=timezone.localdate()
+    if user.role in {User.Role.STAFF,User.Role.NURSE}:raise PermissionDenied('岗位工作台请使用专用页面。')
     if user.role==User.Role.ADMIN:
         paid_total=BillingRecord.objects.filter(status=BillingRecord.Status.PAID).aggregate(total=Sum('amount'))['total'] or 0
         cards=[['医师总数',DoctorProfile.objects.filter(user__is_active=True).count()],['注册患者',PatientProfile.objects.filter(user__is_active=True).count()],['今日预约',Appointment.objects.filter(slot__schedule__date=today).count()],['今日接诊',Appointment.objects.filter(slot__schedule__date=today,status=Appointment.Status.COMPLETED).count()],['当前住院',InpatientAdmission.objects.filter(status=InpatientAdmission.Status.ADMITTED).count()],['累计结算',f'¥{paid_total:.2f}']]
@@ -919,7 +1161,7 @@ def statistics_overview(request):
     dates=[today-timedelta(days=offset) for offset in range(6,-1,-1)]
     counted={row['slot__schedule__date']:row['value'] for row in base.filter(slot__schedule__date__range=(dates[0],today)).values('slot__schedule__date').annotate(value=Count('id'))}
     recent=base.select_related('patient__user','doctor__user','slot__schedule').order_by('-created_at')[:6]
-    payload={'cards':cards,'trend':[{'date':str(day),'value':counted.get(day,0)} for day in dates],'appointment_status':[{'status':label,'value':base.filter(status=value).count()} for value,label in Appointment.Status.choices],'recent_appointments':[{'id':item.id,'appointment_no':item.appointment_no,'patient_name':item.patient.user.get_full_name(),'doctor_name':item.doctor.user.get_full_name(),'date':str(item.slot.schedule.date),'time':item.slot.start_time.strftime('%H:%M'),'status':item.get_status_display()} for item in recent]}
+    payload={'cards':cards,'trend':[{'date':str(day),'value':counted.get(day,0)} for day in dates],'appointment_status':[{'status':label,'value':base.filter(status=value).count()} for value,label in Appointment.Status.choices],'recent_appointments':[{'id':item.id,'appointment_no':item.appointment_no,'patient_name':item.patient.user.get_full_name(),'doctor_name':item.doctor.user.get_full_name(),'date':str(item.visit_date),'time':item.visit_time.strftime('%H:%M'),'status':item.get_status_display()} for item in recent]}
     if user.role==User.Role.ADMIN:
         payload['department_distribution']=list(base.values(name=F('doctor__department__name')).annotate(value=Count('id')).order_by('-value')[:10])
         payload['doctor_workload']=list(Appointment.objects.filter(status=Appointment.Status.COMPLETED).values(name=F('doctor__user__first_name')).annotate(value=Count('id')).order_by('-value')[:10])
@@ -933,13 +1175,15 @@ def _change(current,previous):
 
 @api_view(['GET'])
 def statistics_dashboard(request):
-    user=request.user;range_key=request.query_params.get('range','30d');range_days={'7d':7,'30d':30,'90d':90}
+    user=request.user
+    if user.role in {User.Role.STAFF,User.Role.NURSE}:raise PermissionDenied('岗位工作台请使用专用页面。')
+    range_key=request.query_params.get('range','30d');range_days={'7d':7,'30d':30,'90d':90}
     if range_key not in range_days:raise APIValidationError({'range':'仅支持 7d、30d 或 90d。'})
     days=range_days[range_key];today=timezone.localdate();start=today-timedelta(days=days-1);previous_end=start-timedelta(days=1);previous_start=previous_end-timedelta(days=days-1)
     appointments=Appointment.objects.select_related('patient__user','doctor__user','doctor__department','slot__schedule')
     if user.role==User.Role.DOCTOR:appointments=appointments.filter(doctor__user=user)
     elif user.role==User.Role.PATIENT:appointments=appointments.filter(patient__user=user)
-    current=appointments.filter(slot__schedule__date__range=(start,today));previous=appointments.filter(slot__schedule__date__range=(previous_start,previous_end))
+    current=appointments.filter(Q(slot__schedule__date__range=(start,today))|Q(slot__isnull=True,arrived_at__date__range=(start,today)));previous=appointments.filter(Q(slot__schedule__date__range=(previous_start,previous_end))|Q(slot__isnull=True,arrived_at__date__range=(previous_start,previous_end)))
     def kpi(key,label,value,unit='',previous_value=None,tone='neutral'):
         return {'key':key,'label':label,'value':value,'unit':unit,'change':_change(value,previous_value) if previous_value is not None else None,'tone':tone}
     if user.role==User.Role.ADMIN:
@@ -947,25 +1191,27 @@ def statistics_dashboard(request):
         previous_revenue=BillingRecord.objects.filter(status=BillingRecord.Status.PAID,paid_at__date__range=(previous_start,previous_end)).aggregate(value=Sum('amount'))['value'] or 0
         kpis=[kpi('visits','预约量',current.count(),'人次',previous.count()),kpi('completed','完成诊疗',current.filter(status=Appointment.Status.COMPLETED).count(),'人次',previous.filter(status=Appointment.Status.COMPLETED).count()),kpi('revenue','结算收入',float(revenue),'元',float(previous_revenue)),kpi('inpatients','当前住院',InpatientAdmission.objects.filter(status=InpatientAdmission.Status.ADMITTED).count(),'人'),kpi('examinations','待处理检查',ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS]).count(),'项',tone='warning'),kpi('low_stock','低库存药品',Medicine.objects.filter(is_active=True,stock__lte=10).count(),'种',tone='danger')]
     elif user.role==User.Role.DOCTOR:
-        today_qs=appointments.filter(slot__schedule__date=today)
+        today_qs=appointments.filter(Q(slot__schedule__date=today)|Q(slot__isnull=True,arrived_at__date=today))
         kpis=[kpi('today','今日预约',today_qs.count(),'人次'),kpi('pending','待接诊',today_qs.filter(status=Appointment.Status.PENDING).count(),'人',tone='warning'),kpi('active','诊疗中',today_qs.filter(status=Appointment.Status.IN_PROGRESS).count(),'人'),kpi('completed','完成诊疗',current.filter(status=Appointment.Status.COMPLETED).count(),'人次',previous.filter(status=Appointment.Status.COMPLETED).count()),kpi('examinations','全院待检查',ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS]).count(),'项',tone='warning'),kpi('inpatients','住院患者',InpatientAdmission.objects.filter(status=InpatientAdmission.Status.ADMITTED).count(),'人')]
     else:
         upcoming=appointments.filter(status=Appointment.Status.PENDING,slot__schedule__date__gte=today).count();unpaid=BillingRecord.objects.filter(patient__user=user,status=BillingRecord.Status.UNPAID).aggregate(value=Sum('amount'))['value'] or 0
         kpis=[kpi('upcoming','待就诊预约',upcoming,'项'),kpi('unpaid','待支付费用',float(unpaid),'元',tone='warning' if unpaid else 'neutral'),kpi('reports','已发布报告',ExaminationOrder.objects.filter(patient__user=user,status=ExaminationOrder.Status.PUBLISHED).count(),'份'),kpi('medicine','待取药处方',Prescription.objects.filter(record__appointment__patient__user=user,status=Prescription.Status.ISSUED).count(),'张',tone='warning')]
-    appointment_counts={row['slot__schedule__date']:row for row in current.values('slot__schedule__date').annotate(visits=Count('id'),completed=Count('id',filter=Q(status=Appointment.Status.COMPLETED)))}
+    appointment_counts={}
+    for item in current:
+        day=item.visit_date;row=appointment_counts.setdefault(day,{'visits':0,'completed':0});row['visits']+=1;row['completed']+=1 if item.status==Appointment.Status.COMPLETED else 0
     revenue_counts={row['paid_at__date']:row['value'] for row in BillingRecord.objects.filter(status=BillingRecord.Status.PAID,paid_at__date__range=(start,today)).values('paid_at__date').annotate(value=Sum('amount'))} if user.role==User.Role.ADMIN else {}
     series=[]
     for offset in range(days):
         day=start+timedelta(days=offset);row=appointment_counts.get(day,{})
         series.append({'date':str(day),'visits':row.get('visits',0),'completed':row.get('completed',0),'revenue':float(revenue_counts.get(day,0))})
     recent=current.order_by('-created_at')[:8]
-    payload={'meta':{'range':range_key,'start':str(start),'end':str(today),'generated_at':timezone.now().isoformat(),'role':user.role},'kpis':kpis,'timeseries':series,'appointment_status':[{'name':label,'value':current.filter(status=value).count()} for value,label in Appointment.Status.choices],'recent_activity':[{'id':item.id,'number':item.appointment_no,'patient':item.patient.user.get_full_name(),'doctor':item.doctor.user.get_full_name(),'department':item.doctor.department.name,'date':str(item.slot.schedule.date),'time':item.slot.start_time.strftime('%H:%M'),'status':item.get_status_display()} for item in recent]}
+    payload={'meta':{'range':range_key,'start':str(start),'end':str(today),'generated_at':timezone.now().isoformat(),'role':user.role},'kpis':kpis,'timeseries':series,'appointment_status':[{'name':label,'value':current.filter(status=value).count()} for value,label in Appointment.Status.choices],'recent_activity':[{'id':item.id,'number':item.appointment_no,'patient':item.patient.user.get_full_name(),'doctor':item.doctor.user.get_full_name(),'department':(item.department or item.doctor.department).name,'date':str(item.visit_date),'time':item.visit_time.strftime('%H:%M'),'status':item.get_status_display()} for item in recent]}
     if user.role==User.Role.ADMIN:
         total_beds=WardBed.objects.filter(is_active=True).count();occupied_beds=WardBed.objects.filter(is_active=True,is_occupied=True).count()
         payload.update({'department_workload':list(current.values(name=F('doctor__department__name')).annotate(value=Count('id')).order_by('-value')[:10]),'doctor_workload':list(current.filter(status=Appointment.Status.COMPLETED).values(name=F('doctor__user__first_name')).annotate(value=Count('id')).order_by('-value')[:10]),'billing_categories':list(BillingRecord.objects.filter(status=BillingRecord.Status.PAID,paid_at__date__range=(start,today)).values(name=F('category')).annotate(value=Sum('amount')).order_by('-value')),'bed_utilization':{'total':total_beds,'occupied':occupied_beds,'available':total_beds-occupied_beds,'rate':round(occupied_beds*100/total_beds,1) if total_beds else 0},'inventory_alerts':list(Medicine.objects.filter(is_active=True,stock__lte=10).values('id','name','specification','stock').order_by('stock')[:10]),'inpatient_status':[{'name':label,'value':InpatientAdmission.objects.filter(status=value).count()} for value,label in InpatientAdmission.Status.choices],'workflow':[{'name':'预约','value':current.count()},{'name':'进入诊疗','value':current.filter(status__in=[Appointment.Status.IN_PROGRESS,Appointment.Status.COMPLETED]).count()},{'name':'完成诊疗','value':current.filter(status=Appointment.Status.COMPLETED).count()},{'name':'确认病历','value':MedicalRecord.objects.filter(appointment__in=current,status=MedicalRecord.Status.CONFIRMED).count()},{'name':'开具处方','value':Prescription.objects.filter(record__appointment__in=current).count()},{'name':'完成结算','value':BillingRecord.objects.filter(appointment__in=current,status=BillingRecord.Status.PAID).count()}],'alerts':[{'label':'待就诊预约','value':Appointment.objects.filter(status=Appointment.Status.PENDING).count(),'tone':'warning','path':'/console/outpatient?tab=appointments'},{'label':'待处理检查','value':ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS]).count(),'tone':'warning','path':'/console/clinical?tab=examinations'},{'label':'待结算账单','value':BillingRecord.objects.filter(status=BillingRecord.Status.UNPAID).count(),'tone':'danger','path':'/console/operations?tab=bills'},{'label':'低库存药品','value':Medicine.objects.filter(is_active=True,stock__lte=10).count(),'tone':'danger','path':'/console/clinical?tab=medicines'}]})
     elif user.role==User.Role.DOCTOR:
-        schedule=appointments.filter(slot__schedule__date=today).order_by('slot__start_time')
-        payload.update({'today_schedule':[{'id':item.id,'time':item.slot.start_time.strftime('%H:%M'),'patient':item.patient.user.get_full_name(),'reason':item.reason,'status':item.status,'status_label':item.get_status_display()} for item in schedule],'examination_queue':[{'id':item.id,'number':item.order_no,'patient':item.patient.user.get_full_name(),'patient_id':item.patient_id,'type':item.get_type_display(),'status':item.status,'status_label':item.get_status_display(),'created_at':item.created_at.isoformat()} for item in ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS,ExaminationOrder.Status.COMPLETED]).select_related('patient__user').order_by('created_at')[:8]],'alerts':[{'label':'待接诊','value':schedule.filter(status=Appointment.Status.PENDING).count(),'tone':'warning','path':'/doctor/outpatient?tab=appointments'},{'label':'诊疗中','value':schedule.filter(status=Appointment.Status.IN_PROGRESS).count(),'tone':'neutral','path':'/doctor/outpatient?tab=appointments'},{'label':'待处理检查','value':ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS]).count(),'tone':'warning','path':'/doctor/clinical?tab=examinations'}]})
+        schedule=appointments.filter(Q(slot__schedule__date=today)|Q(slot__isnull=True,arrived_at__date=today)).order_by('triage_level','slot__start_time','-created_at')
+        payload.update({'today_schedule':[{'id':item.id,'time':item.visit_time.strftime('%H:%M'),'patient':item.patient.user.get_full_name(),'reason':item.reason,'status':item.status,'status_label':item.get_status_display(),'visit_type':item.visit_type,'triage_level':item.triage_level} for item in schedule],'examination_queue':[{'id':item.id,'number':item.order_no,'patient':item.patient.user.get_full_name(),'patient_id':item.patient_id,'type':item.get_type_display(),'status':item.status,'status_label':item.get_status_display(),'created_at':item.created_at.isoformat()} for item in ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS,ExaminationOrder.Status.COMPLETED]).select_related('patient__user').order_by('created_at')[:8]],'alerts':[{'label':'待接诊','value':schedule.filter(status=Appointment.Status.PENDING).count(),'tone':'warning','path':'/doctor/outpatient?tab=appointments'},{'label':'诊疗中','value':schedule.filter(status=Appointment.Status.IN_PROGRESS).count(),'tone':'neutral','path':'/doctor/outpatient?tab=appointments'},{'label':'待处理检查','value':ExaminationOrder.objects.filter(status__in=[ExaminationOrder.Status.REQUESTED,ExaminationOrder.Status.IN_PROGRESS]).count(),'tone':'warning','path':'/doctor/clinical?tab=examinations'}]})
     else:
         next_item=appointments.filter(status=Appointment.Status.PENDING,slot__schedule__date__gte=today).order_by('slot__schedule__date','slot__start_time').first()
         next_appointment=None if not next_item else {'id':next_item.id,'number':next_item.appointment_no,'patient':next_item.patient.user.get_full_name(),'doctor':next_item.doctor.user.get_full_name(),'department':next_item.doctor.department.name,'date':str(next_item.slot.schedule.date),'time':next_item.slot.start_time.strftime('%H:%M'),'status':next_item.get_status_display()}

@@ -6,18 +6,28 @@ import api from'../../services/api'
 import{confirmRecord,createRecord,completeVisit,getClinicalHistory,updateRecord}from'../../services/records'
 import{getDepartments,startAppointment}from'../../services/appointments'
 import{downloadMedicalFile,getExaminations}from'../../services/examinations'
+import{cancelPrescription}from'../../services/prescriptions'
+import{cancelProcedure}from'../../services/clinical'
 import{statusInfo}from'../../utils/status'
-import type{Appointment,ClinicalHistory,Department,ExaminationOrder,InpatientAdmission,MedicalRecord,PageResult,PatientSummary,Prescription}from'../../types/medical'
+import PrescriptionForm from'../../components/clinic/PrescriptionForm.vue'
+import ExaminationForm from'../../components/clinic/ExaminationForm.vue'
+import ProcedureForm from'../../components/clinic/ProcedureForm.vue'
+import AdmissionForm from'../../components/clinic/AdmissionForm.vue'
+import TemplatePicker from'../../components/clinic/TemplatePicker.vue'
+import type{Appointment,ClinicalHistory,Department,ExaminationOrder,InpatientAdmission,MedicalRecord,PageResult,PatientSummary,Prescription,ProcedureOrder,RecordTemplate}from'../../types/medical'
 
-interface Workspace{appointment:Appointment;patient:PatientSummary&Record<string,any>;current_record:MedicalRecord|null;history:MedicalRecord[];history_count:number;prescriptions:Prescription[];examinations:ExaminationOrder[];admissions:InpatientAdmission[]}
-type TabName='current'|'history'|'examinations'|'care'
-const route=useRoute(),router=useRouter(),loading=ref(false),saving=ref(false),data=ref<Workspace|null>(null),activeTab=ref<TabName>('current')
+interface Workspace{appointment:Appointment;patient:PatientSummary&Record<string,any>;current_record:MedicalRecord|null;history:MedicalRecord[];history_count:number;prescriptions:Prescription[];examinations:ExaminationOrder[];procedures:ProcedureOrder[];admissions:InpatientAdmission[];templates:RecordTemplate[]}
+type TabName='current'|'orders'|'history'|'examinations'|'care'
+type OrderTab='prescription'|'examination'|'procedure'|'admission'
+const route=useRoute(),router=useRouter(),loading=ref(false),saving=ref(false),data=ref<Workspace|null>(null),activeTab=ref<TabName>('current'),orderTab=ref<OrderTab>('prescription')
 const form=reactive({chief_complaint:'',present_illness:'',past_history:'',examination:'',diagnosis:'',treatment:''})
 const baseline=ref(''),lastSaved=ref(''),departments=ref<Department[]>([])
-const history=ref<ClinicalHistory|null>(null),historyLoading=ref(false),historyPage=ref(1),historyFilters=reactive({range:null as [string,string]|null,department:'' as string|number,diagnosis:'',search:''})
+const history=ref<ClinicalHistory|null>(null),historyLoading=ref(false),historyPage=ref(1),historyFilters=reactive({range:null as[string,string]|null,department:'' as string|number,diagnosis:'',search:''})
 const exams=ref<PageResult<ExaminationOrder>|null>(null),examLoading=ref(false),examPage=ref(1),examStatus=ref('')
+const prescriptionOpen=ref(false),examinationOpen=ref(false),procedureOpen=ref(false),admissionOpen=ref(false),templateOpen=ref(false)
 const appointmentId=computed(()=>Number(route.params.appointmentId))
 const patientId=computed(()=>data.value?.patient?.id)
+const currentRecordId=computed(()=>data.value?.current_record?.id||0)
 const returnPath=computed(()=>typeof route.query.returnTo==='string'&&route.query.returnTo.startsWith('/')?route.query.returnTo:'/doctor/outpatient?tab=appointments')
 const currentLocked=computed(()=>data.value?.appointment.status!=='in_progress'||data.value?.current_record?.status==='confirmed')
 const dirty=computed(()=>Boolean(data.value)&&snapshot()!==baseline.value&&!currentLocked.value)
@@ -37,6 +47,32 @@ async function download(id:number,name:string){try{await downloadMedicalFile(id,
 function resetHistory(){Object.assign(historyFilters,{range:null,department:'',diagnosis:'',search:''});loadHistory(1)}
 function prescriptionNames(row:Prescription){return row.items?.map(item=>item.medicine_name).filter(Boolean).join('、')||row.notes||'—'}
 function jumpToRecord(recordNo?:string){if(!recordNo)return;activeTab.value='history';historyFilters.search=recordNo;loadHistory(1)}
+
+function ensureRecord(){if(!currentRecordId.value){ElMessage.warning('请先在“本次病历”保存草稿，再开具医嘱');activeTab.value='current';return false}if(data.value?.current_record?.status!=='confirmed'){ElMessage.warning('请先确认本次病历，再开具医嘱');activeTab.value='current';return false}return true}
+function openOrder(kind:OrderTab){
+  if(!ensureRecord())return
+  orderTab.value=kind;activeTab.value='orders'
+  if(kind==='prescription')prescriptionOpen.value=true
+  else if(kind==='examination')examinationOpen.value=true
+  else if(kind==='procedure')procedureOpen.value=true
+  else admissionOpen.value=true
+}
+async function afterOrderSaved(){await load();activeTab.value='orders'}
+async function cancelRx(row:Prescription){try{await ElMessageBox.confirm('作废后患者将无法缴费取药。','作废处方',{type:'warning'});await cancelPrescription(row.id);ElMessage.success('处方已作废');await load()}catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(errorText(e,'作废失败'))}}
+async function cancelProc(row:ProcedureOrder){try{await ElMessageBox.confirm('取消后费用账单也会取消。','取消处置',{type:'warning'});await cancelProcedure(row.id);ElMessage.success('处置已取消');await load()}catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(errorText(e,'取消失败'))}}
+function applyTemplate(payload:{diagnosis:string;chief_complaint:string;present_illness:string;past_history:string;examination:string;treatment:string}){Object.assign(form,payload);ElMessage.success('模板已套用，请核对左右/轻重等细节');activeTab.value='current'}
+function fulfillmentText(row:{fulfillment_status?:string;status_display?:string}){
+  const map:Record<string,string>={unpaid:'待缴费',to_dispense:'待发药',dispensed:'已发药',to_execute:'待执行',in_progress:'执行中',completed:'已完成',report_pending:'报告待录入',published:'已发布',refunded:'已退费',cancelled:'已取消',no_bill:'未生成账单'}
+  return map[row.fulfillment_status||'']||row.status_display||'—'
+}
+function fulfillmentTone(row:{fulfillment_status?:string;status?:string}){
+  const key=row.fulfillment_status||row.status||''
+  if(['unpaid','to_dispense','to_execute'].includes(key))return'warning'
+  if(key==='in_progress')return'primary'
+  if(['completed','dispensed','published'].includes(key))return'success'
+  return'info'
+}
+function admissionStatus(row:InpatientAdmission){return statusInfo('inpatient',row.status).label}
 async function guardLeave(){if(!dirty.value)return true;try{await ElMessageBox.confirm('本次病历有未保存的修改，离开后将丢失。确定离开吗？','未保存的修改',{type:'warning',confirmButtonText:'仍然离开'});return true}catch{return false}}
 function beforeUnload(event:BeforeUnloadEvent){if(dirty.value){event.preventDefault();event.returnValue=''}}
 onBeforeRouteLeave(async()=>await guardLeave())
@@ -47,7 +83,7 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
 <template>
   <section v-loading="loading">
     <div class="page-heading visit-heading">
-      <div><el-button link @click="router.push(returnPath)">← {{returnPath==='/dashboard'?'返回工作台':'返回接诊列表'}}</el-button><h1>诊疗工作区</h1><p v-if="data">{{data.appointment.appointment_no}} · {{data.appointment.slot.date}} {{data.appointment.slot.start_time.slice(0,5)}} · {{data.appointment.department_name}}</p></div>
+      <div><el-button link @click="router.push(returnPath)">← {{returnPath==='/dashboard'?'返回工作台':'返回接诊列表'}}</el-button><h1>诊疗工作区</h1><p v-if="data">{{data.appointment.appointment_no}} · {{data.appointment.visit_date}} {{data.appointment.visit_time}} · {{data.appointment.department_name}}<span v-if="data.appointment.is_emergency" class="emergency-badge">急诊 {{data.appointment.triage_level}} 级</span></p></div>
       <div v-if="data" class="visit-actions"><el-tag size="large" :type="statusInfo('appointment',data.appointment.status).tone">{{statusInfo('appointment',data.appointment.status).label}}</el-tag><el-button v-if="data.appointment.status==='pending'" type="primary" @click="begin">开始接诊</el-button><el-button v-if="data.current_record?.status==='confirmed'&&data.appointment.status==='in_progress'" type="success" @click="finish">完成诊疗</el-button></div>
     </div>
     <template v-if="data">
@@ -61,10 +97,9 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
       <el-card class="visit-tabs-card">
         <el-tabs v-model="activeTab" @tab-change="changeTab">
           <el-tab-pane label="本次病历" name="current">
-            <template #label><span>本次病历</span></template>
             <div class="editor-head">
               <div><h2>本次病历</h2><p>{{data.current_record?data.current_record.record_no:'本次就诊尚未建立病历'}}<template v-if="lastSaved"> · 草稿保存于 {{lastSaved}}</template></p></div>
-              <el-tag v-if="data.current_record" :type="statusInfo('record',data.current_record.status).tone">{{statusInfo('record',data.current_record.status).label}}</el-tag>
+              <div class="editor-head-actions"><el-button v-if="data.templates?.length" plain @click="templateOpen=true">套用模板</el-button><el-tag v-if="data.current_record" :type="statusInfo('record',data.current_record.status).tone">{{statusInfo('record',data.current_record.status).label}}</el-tag></div>
             </div>
             <el-alert v-if="data.appointment.status==='pending'" title="请先开始接诊，再建立本次病历。" type="warning" :closable="false"/>
             <el-alert v-else-if="dirty" title="病历有未保存修改；离开页面前请保存草稿。" type="warning" :closable="false" show-icon/>
@@ -75,6 +110,53 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
             </el-form>
             <div v-if="!currentLocked" class="editor-actions"><el-button type="primary" :loading="saving" @click="save">保存草稿</el-button><el-button v-if="data.current_record" type="success" plain @click="confirm">确认病历</el-button></div>
             <el-alert v-if="data.current_record?.status==='confirmed'" title="病历已确认，原始内容不可覆盖；如需补充请在电子病历页追加更正。" type="success" :closable="false"/>
+          </el-tab-pane>
+
+          <el-tab-pane name="orders">
+            <template #label><span>医嘱</span><em class="tab-count">{{(data.prescriptions?.length||0)+(data.examinations?.length||0)+(data.procedures?.length||0)}}</em></template>
+            <div class="orders-head"><div><h2>本次医嘱</h2><p>处方、检查、处置与住院申请都在这里开具，自动关联当前病历</p></div><div class="orders-actions"><el-button type="primary" @click="openOrder('prescription')">＋ 处方</el-button><el-button @click="openOrder('examination')">＋ 检查</el-button><el-button @click="openOrder('procedure')">＋ 处置</el-button><el-button @click="openOrder('admission')">＋ 住院</el-button></div></div>
+            <el-radio-group v-model="orderTab" class="order-switch">
+              <el-radio-button value="prescription">处方 {{data.prescriptions?.length||0}}</el-radio-button>
+              <el-radio-button value="examination">检查 {{data.examinations?.length||0}}</el-radio-button>
+              <el-radio-button value="procedure">处置 {{data.procedures?.length||0}}</el-radio-button>
+              <el-radio-button value="admission">住院 {{data.admissions?.length||0}}</el-radio-button>
+            </el-radio-group>
+
+            <div v-if="orderTab==='prescription'" class="order-list">
+              <article v-for="row in data.prescriptions" :key="row.id" class="order-item">
+                <header><div><b>处方 {{row.prescription_no}}</b><small>{{row.items?.length||0}} 种药品 · ¥{{row.total_amount}} · {{row.bill_no||'未生成账单'}}</small></div><el-tag :type="fulfillmentTone(row)">{{fulfillmentText(row)}}</el-tag></header>
+                <p>{{prescriptionNames(row)}}</p>
+                <footer><span>库存：{{row.items?.map(item=>`${item.medicine_name} ${item.stock??'—'}`).join(' · ')}}</span><el-button v-if="row.status==='issued'&&row.payment_status!=='paid'" link type="danger" @click="cancelRx(row)">作废</el-button></footer>
+              </article>
+              <el-empty v-if="!data.prescriptions?.length" description="本次尚未开具处方"/>
+            </div>
+
+            <div v-else-if="orderTab==='examination'" class="order-list">
+              <article v-for="row in data.examinations" :key="row.id" class="order-item">
+                <header><div><b>{{row.item_name_snapshot||'检查'}}</b><small>{{row.order_no}} · {{row.type_display}} · ¥{{row.price_snapshot}}</small></div><el-tag :type="fulfillmentTone(row)">{{fulfillmentText(row)}}</el-tag></header>
+                <p>{{row.clinical_question}}</p>
+                <footer><span>{{row.report?'报告已录入':'报告待录入'}}<template v-if="row.started_by_name"> · 执行 {{row.started_by_name}}</template></span></footer>
+              </article>
+              <el-empty v-if="!data.examinations?.length" description="本次尚未开具检查"/>
+            </div>
+
+            <div v-else-if="orderTab==='procedure'" class="order-list">
+              <article v-for="row in data.procedures" :key="row.id" class="order-item">
+                <header><div><b>{{row.item_name_snapshot||'处置'}}</b><small>{{row.order_no}} · {{row.category_display}} · ¥{{row.price_snapshot}}</small></div><el-tag :type="fulfillmentTone(row)">{{fulfillmentText(row)}}</el-tag></header>
+                <p>{{row.clinical_note||'无处置说明'}}</p>
+                <footer><span>{{row.executed_by_name?`执行人 ${row.executed_by_name}`:'待执行科室确认'}}</span><el-button v-if="row.status==='requested'&&row.payment_status!=='paid'" link type="danger" @click="cancelProc(row)">取消</el-button></footer>
+              </article>
+              <el-empty v-if="!data.procedures?.length" description="本次尚未开具处置"/>
+            </div>
+
+            <div v-else class="order-list">
+              <article v-for="row in data.admissions" :key="row.id" class="order-item">
+                <header><div><b>住院 {{row.admission_no}}</b><small>{{row.department_name}} · {{row.ward||'待分配'}} {{row.bed_no||''}}</small></div><el-tag :type="statusInfo('inpatient',row.status).tone">{{admissionStatus(row)}}</el-tag></header>
+                <p>{{row.admission_diagnosis}}</p>
+                <footer><span>{{row.received_at?'护士已接诊':'等待住院处办理 / 护士接诊'}}</span><router-link :to="{path:`/inpatient/${row.id}`}"><el-button link type="primary">住院病志与医嘱 →</el-button></router-link></footer>
+              </article>
+              <el-empty v-if="!data.admissions?.length" description="本次尚无住院记录"/>
+            </div>
           </el-tab-pane>
 
           <el-tab-pane label="历次就诊" name="history">
@@ -97,7 +179,7 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
                     <div><span>体格 / 辅助检查</span><p>{{record.examination||'—'}}</p></div>
                     <div><span>处理意见</span><p>{{record.treatment||'—'}}</p></div>
                     <div><span>确认时间</span><b>{{record.confirmed_at?.replace('T',' ').slice(0,16)||'—'}}</b></div>
-                    <div><span>关联事项</span><b>{{record.prescription_count||0}} 张处方 · {{record.admission_count||0}} 条住院记录</b></div>
+                    <div><span>关联事项</span><b>{{record.prescription_count||0}} 张处方 · {{record.procedure_count||0}} 项处置 · {{record.admission_count||0}} 条住院记录</b></div>
                     <section v-if="record.examinations?.length"><h3>关联检查</h3>
                       <article v-for="exam in record.examinations" :key="exam.id">
                         <b>{{exam.order_no}} · {{exam.item_name}} · {{statusInfo('examination',exam.status).label}}</b>
@@ -138,15 +220,21 @@ onBeforeUnmount(()=>window.removeEventListener('beforeunload',beforeUnload))
           <el-tab-pane label="处方与住院" name="care">
             <div class="care-grid">
               <el-card><template #header><div class="section-head"><div><h2>本次处方</h2><p>{{data.prescriptions.length}} 张处方</p></div><router-link to="/doctor/clinical?tab=prescriptions"><el-button link type="primary">全部处方</el-button></router-link></div></template>
-                <el-table :data="data.prescriptions" empty-text="本次就诊暂无处方"><el-table-column prop="prescription_no" label="处方号" min-width="140"/><el-table-column label="药品"><template #default="{row}">{{prescriptionNames(row)}}</template></el-table-column><el-table-column label="金额" width="100"><template #default="{row}">¥{{row.total_amount}}</template></el-table-column><el-table-column prop="status" label="状态" width="110"><template #default="{row}">{{row.status==='dispensed'?'已取药':row.status==='cancelled'?'已作废':'待缴费取药'}}</template></el-table-column></el-table>
+                <el-table :data="data.prescriptions" empty-text="本次就诊暂无处方"><el-table-column prop="prescription_no" label="处方号" min-width="140"/><el-table-column label="药品"><template #default="{row}">{{prescriptionNames(row)}}</template></el-table-column><el-table-column label="金额" width="100"><template #default="{row}">¥{{row.total_amount}}</template></el-table-column><el-table-column label="状态" width="110"><template #default="{row}"><el-tag :type="fulfillmentTone(row)">{{fulfillmentText(row)}}</el-tag></template></el-table-column></el-table>
               </el-card>
               <el-card><template #header><div class="section-head"><div><h2>住院记录</h2><p>该患者最近住院情况</p></div><router-link to="/doctor/inpatient?tab=admissions"><el-button link type="primary">住院管理</el-button></router-link></div></template>
-                <el-table :data="data.admissions" empty-text="暂无住院记录"><el-table-column prop="admission_no" label="住院号" min-width="140"/><el-table-column prop="department_name" label="科室" min-width="110"/><el-table-column label="床位" min-width="100"><template #default="{row}">{{row.ward}} {{row.bed_no}}</template></el-table-column><el-table-column label="状态" width="95"><template #default="{row}"><el-tag :type="statusInfo('inpatient',row.status).tone">{{statusInfo('inpatient',row.status).label}}</el-tag></template></el-table-column><el-table-column label="操作" width="90"><template #default="{row}"><router-link :to="{path:`/doctor/inpatients/${row.id}`,query:{returnTo:route.fullPath}}"><el-button link type="primary">详情</el-button></router-link></template></el-table-column></el-table>
+                <el-table :data="data.admissions" empty-text="暂无住院记录"><el-table-column prop="admission_no" label="住院号" min-width="140"/><el-table-column prop="department_name" label="科室" min-width="110"/><el-table-column label="床位" min-width="100"><template #default="{row}">{{row.ward}} {{row.bed_no}}</template></el-table-column><el-table-column label="状态" width="95"><template #default="{row}"><el-tag :type="statusInfo('inpatient',row.status).tone">{{statusInfo('inpatient',row.status).label}}</el-tag></template></el-table-column><el-table-column label="操作" width="130"><template #default="{row}"><router-link :to="{path:`/inpatient/${row.id}`}"><el-button link type="primary">病志/医嘱</el-button></router-link></template></el-table-column></el-table>
               </el-card>
             </div>
           </el-tab-pane>
         </el-tabs>
       </el-card>
     </template>
+
+    <PrescriptionForm v-model="prescriptionOpen" :record-id="currentRecordId" :patient-name="data?.patient?.full_name" @saved="afterOrderSaved"/>
+    <ExaminationForm v-model="examinationOpen" :record-id="currentRecordId" :patient-name="data?.patient?.full_name" @saved="afterOrderSaved"/>
+    <ProcedureForm v-model="procedureOpen" :record-id="currentRecordId" :patient-name="data?.patient?.full_name" @saved="afterOrderSaved"/>
+    <AdmissionForm v-model="admissionOpen" :patient-id="data?.patient?.id||0" :patient-name="data?.patient?.full_name" :doctor-id="data?.appointment?.doctor_id||0" :department-id="data?.appointment?.department_id" :department-name="data?.appointment?.department_name" :appointment-id="data?.appointment?.id" @saved="afterOrderSaved"/>
+    <TemplatePicker v-model="templateOpen" :templates="data?.templates||[]" @apply="applyTemplate"/>
   </section>
 </template>

@@ -84,14 +84,19 @@ const routes:RouteRecordRaw[]=[
     route('/doctor/inpatient','doctor-inpatient','doctor/Inpatient',['doctor']),
     route('/doctor/visits/:appointmentId','doctor-visit-workspace','doctor/VisitWorkspace',['doctor'],{activePath:'/doctor/outpatient'}),
     route('/doctor/inpatients/:admissionId','doctor-inpatient-detail','shared/AdmissionDetail',['doctor'],{activePath:'/doctor/inpatient'}),
+    route('/inpatient/:admissionId','inpatient-workspace','shared/InpatientWorkspace',['doctor','nurse']),
+    // 护士与科室事务员
+    route('/nurse','nurse-workspace','nurse/Workspace',['nurse']),
+    route('/staff','staff-workspace','staff/Workspace',['staff']),
     // 患者主栏目
     route('/patient/visits','patient-visits','patient/Visits',['patient']),
     route('/patient/records','patient-records','shared/Archive',['patient']),
     route('/patient/care','patient-care','patient/Care',['patient']),
     route('/patient/finance','patient-finance','patient/Finance',['patient']),
     route('/patient/inpatients/:admissionId','patient-inpatient-detail','shared/AdmissionDetail',['patient'],{activePath:'/patient/care'}),
-    route('/profile','profile','shared/Profile',['admin','doctor','patient']),
+    route('/profile','profile','shared/Profile',['admin','doctor','nurse','staff','patient']),
   ]},
+  {path:'/share/report/:token',name:'shared-report',component:view('shared/SharedReport'),meta:{public:true,title:'检查报告分享'}},
   ...legacyRouteRecords,
   {path:'/:pathMatch(.*)*',redirect:'/dashboard'},
 ]
@@ -99,12 +104,16 @@ const routes:RouteRecordRaw[]=[
 const router=createRouter({history:createWebHistory(import.meta.env.BASE_URL),routes})
 router.beforeEach(to=>{
   const auth=useAuthStore()
+  if(to.meta.public)return true
   if(to.name==='login'||to.name==='register')return auth.user?'/dashboard':true
   if(!auth.user)return{name:'login',query:{redirect:to.fullPath}}
   const legacy=legacyRedirect(to.path,to.query)
   if(legacy)return{path:legacy.path,query:legacy.query,replace:true}
+  if(to.path==='/dashboard'&&auth.user.role==='staff')return'/staff'
+  if(to.path==='/dashboard'&&auth.user.role==='nurse')return'/nurse'
   const roles=to.meta.roles as UserRole[]|undefined
-  return roles&&!roles.includes(auth.user.role)?'/dashboard':true
+  if(roles&&!roles.includes(auth.user.role))return auth.user.role==='staff'?'/staff':auth.user.role==='nurse'?'/nurse':'/dashboard'
+  return true
 })
 router.afterEach(to=>{
   document.title=typeof to.meta.title==='string'?`${to.meta.title} · 慧医云`:'慧医云'
